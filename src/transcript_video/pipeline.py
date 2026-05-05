@@ -126,6 +126,7 @@ def run_pipeline(config: RunConfig) -> dict[str, Path]:
             num_speakers=config.diarization.num_speakers,
             min_speakers=config.diarization.min_speakers,
             max_speakers=config.diarization.max_speakers,
+            model_name=config.diarization.model_name,
         )
 
     aligned_segments = list(aligned.get("segments", []))
@@ -159,6 +160,7 @@ def run_pipeline(config: RunConfig) -> dict[str, Path]:
             "no_speech_threshold": 0.5 if config.anti_loop else None,
             "diarization": {
                 "enabled": config.diarization.enabled,
+                "model_name": config.diarization.model_name,
                 "num_speakers": config.diarization.num_speakers,
                 "min_speakers": config.diarization.min_speakers,
                 "max_speakers": config.diarization.max_speakers,

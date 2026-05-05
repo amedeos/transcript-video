@@ -88,6 +88,15 @@ If you find yourself "improving" any of these, double-check the upstream behavio
 
 `diarize.resolve_hf_token` checks (in order): `--hf-token`, `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`, `HUGGINGFACE_TOKEN`, then `~/.cache/huggingface/token`. Diarization aborts with a clear message if none is found. Don't silently disable diarization on missing token — that's `--no-diarize`'s job.
 
+## whisperX API drift
+
+whisperX's API has churned across 3.x. We adapt at runtime instead of pinning a tight version:
+
+- **Class location**: `_resolve_diarization_api()` looks up `DiarizationPipeline` in both `whisperx.diarize` (modern) and top-level `whisperx` (older). Don't add `whisperx.diarize.Pipeline` to that lookup — it re-exports pyannote's raw `Pipeline` and has an incompatible `__init__`.
+- **Constructor signature**: `_build_pipeline_init_kwargs()` introspects `__init__.parameters` and picks the first matching token kwarg from `("token", "use_auth_token", "auth_token")`. The `device` and `model_name`/`model` kwargs are forwarded only if the signature accepts them.
+- **Default diarization model**: whisperX currently defaults to `pyannote/speaker-diarization-community-1` (gated). The older `pyannote/speaker-diarization-3.1` works too via `--diarize-model`. Both require accepting their terms on huggingface.co.
+- **Gated-repo errors**: `diarize_and_assign()` catches `GatedRepoError` / 403 / Forbidden during pipeline construction and prints an actionable hint with the URL to visit. Keep that branch when refactoring — silently re-raising the HF stack trace is what the previous version did, and it's user-hostile.
+
 ## License
 
 GPL v3 (inherited from the reference project). Don't relicense without explicit user approval.

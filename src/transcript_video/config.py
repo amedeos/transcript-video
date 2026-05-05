@@ -13,6 +13,7 @@ class DiarizationConfig:
     num_speakers: int | None = None
     min_speakers: int | None = None
     max_speakers: int | None = None
+    model_name: str | None = None  # ``None`` = whisperX default (currently community-1).
 
 
 @dataclass

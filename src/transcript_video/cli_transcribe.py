@@ -86,6 +86,16 @@ Examples:
         default=None,
         help="HuggingFace token; falls back to HF_TOKEN env var, then ~/.cache/huggingface/token.",
     )
+    diar_group.add_argument(
+        "--diarize-model",
+        default=None,
+        help=(
+            "pyannote model id (default: whisperX's built-in, currently "
+            "pyannote/speaker-diarization-community-1). Common alternative: "
+            "pyannote/speaker-diarization-3.1. Both are gated repos and require "
+            "accepting their terms on huggingface.co."
+        ),
+    )
     diar_group.add_argument("--num-speakers", type=int, default=None, help="Exact number of speakers.")
     diar_group.add_argument("--min-speakers", type=int, default=None, help="Lower bound for speaker count.")
     diar_group.add_argument("--max-speakers", type=int, default=None, help="Upper bound for speaker count.")
@@ -176,6 +186,7 @@ def main(argv: list[str] | None = None) -> None:
         diarization=DiarizationConfig(
             enabled=not args.no_diarize,
             hf_token=args.hf_token,
+            model_name=args.diarize_model,
             num_speakers=args.num_speakers,
             min_speakers=args.min_speakers,
             max_speakers=args.max_speakers,

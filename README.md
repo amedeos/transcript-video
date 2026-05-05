@@ -21,7 +21,7 @@ This project is the English-language successor of [transcript-italian-video](htt
 - Python 3.10+
 - ffmpeg available on `$PATH`
 - For GPU runs: NVIDIA driver + CUDA (≥10 GB VRAM recommended; 16 GB+ for `large-v3`)
-- For diarization: a HuggingFace account with the [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) model terms accepted, plus an HF token
+- For diarization: a HuggingFace account with the diarization model's terms accepted, plus an HF token. whisperX's current default is [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1); the older [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) is also supported via `--diarize-model`. **Both are gated repos** — visit the model page once and click "Agree and access repository" before running diarization, otherwise the pipeline aborts with a 403 GatedRepo error.
 
 ## Installation
 
@@ -145,6 +145,7 @@ transcribe-video lecture.mp4 --no-diarize --txt --srt
 |------|-------------|
 | `--no-diarize` | Skip pyannote |
 | `--hf-token TOKEN` | HF token (else env / cached file) |
+| `--diarize-model ID` | pyannote model id (default: whisperX's built-in, currently `pyannote/speaker-diarization-community-1`; alternative: `pyannote/speaker-diarization-3.1`) |
 | `--num-speakers N` | Exact speaker count |
 | `--min-speakers N` / `--max-speakers N` | Bounds (improves quality) |
 | `--speaker-map "L0=Name0,L1=Name1"` | Inline label→name map |
@@ -267,12 +268,16 @@ nvidia-smi
 uv pip install -e ".[cuda]" --force-reinstall
 ```
 
-### Diarization fails with 401/403
+### Diarization fails with 401/403 / GatedRepoError
 
-Accept the model terms on HuggingFace and ensure your token has read access:
+The diarization model is gated — you must accept its terms on huggingface.co before the first download. The pipeline now detects this and prints actionable instructions, but the steps are:
 
-- https://huggingface.co/pyannote/speaker-diarization-3.1
-- https://huggingface.co/pyannote/segmentation-3.0
+1. Visit the model page and click **Agree and access repository**:
+   - https://huggingface.co/pyannote/speaker-diarization-community-1 (whisperX default)
+   - or https://huggingface.co/pyannote/speaker-diarization-3.1 if you pass `--diarize-model pyannote/speaker-diarization-3.1`
+   - some pipelines also depend on https://huggingface.co/pyannote/segmentation-3.0
+2. Confirm your token has `read` scope at https://hf.co/settings/tokens
+3. Re-run; the model is downloaded once and cached locally
 
 ### "Alignment model unavailable for language"
 
