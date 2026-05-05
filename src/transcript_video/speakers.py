@@ -108,13 +108,22 @@ def parse_speaker_map_file(path: str | Path) -> dict[str, str]:
 
 
 def resolve_speaker_map(
-    inline: str | None, file_path: str | None
+    inline: str | None,
+    file_path: str | None,
+    fallback: dict[str, str] | None = None,
 ) -> dict[str, str]:
-    """Resolve a speaker map from CLI inputs. Returns an empty dict if neither is given."""
+    """Resolve a speaker map from CLI inputs.
+
+    Precedence: ``--speaker-map`` > ``--speaker-map-file`` > ``fallback`` > ``{}``.
+    The ``fallback`` is the inline map declared in a project config file
+    (``transcript-video.toml``'s ``[speaker_map]``).
+    """
     if inline:
         return parse_speaker_map_inline(inline)
     if file_path:
         return parse_speaker_map_file(file_path)
+    if fallback:
+        return dict(fallback)
     return {}
 
 

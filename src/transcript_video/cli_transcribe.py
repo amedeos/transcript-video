@@ -6,6 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from . import project_config
 from .config import DiarizationConfig, FrontmatterConfig, OutputConfig, RunConfig
 from .pipeline import run_pipeline
 from .preflight import report_results, run_preflight
@@ -205,7 +206,56 @@ Examples:
         help="Override the frontmatter 'source' field (default: input file basename).",
     )
 
+    config_group = parser.add_argument_group("Project config")
+    config_group.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "Path to a transcript-video.toml config file. If omitted, the tool "
+            "looks for one in the current directory and then alongside the input video."
+        ),
+    )
+    config_group.add_argument(
+        "--profile",
+        default=None,
+        help="Apply [profiles.NAME] from the config on top of the top-level defaults.",
+    )
+
     return parser
+
+
+def _build_pre_parser() -> argparse.ArgumentParser:
+    """Mini parser for the --config / --profile / input_file early lookup.
+
+    Used so the project config file can be resolved BEFORE the main parser
+    decides on defaults; without this, --profile would be applied too late.
+    """
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=None)
+    pre.add_argument("--profile", default=None)
+    pre.add_argument("input_file", nargs="?", default=None)
+    return pre
+
+
+def _apply_config_defaults(
+    parser: argparse.ArgumentParser, cli_defaults: dict
+) -> tuple[set[str], set[str]]:
+    """Filter the config's flat dict to keys recognized by the main parser.
+
+    Returns ``(applied, ignored)`` for diagnostics. Also calls
+    ``parser.set_defaults`` for the applied keys.
+    """
+    known = {a.dest for a in parser._actions if a.dest != "help"}
+    applied: dict = {}
+    ignored: set[str] = set()
+    for key, value in cli_defaults.items():
+        if key in known:
+            applied[key] = value
+        else:
+            ignored.add(key)
+    if applied:
+        parser.set_defaults(**applied)
+    return set(applied.keys()), ignored
 
 
 def _resolve_prompt(args: argparse.Namespace) -> str | None:
@@ -229,11 +279,40 @@ def _resolve_hotwords(args: argparse.Namespace) -> str | None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    # Pre-parse to find --config / --profile / input_file so we can locate the
+    # config file BEFORE the main parser computes defaults.
+    pre_args, _ = _build_pre_parser().parse_known_args(argv)
+    pre_input_path: Path | None = Path(pre_args.input_file) if pre_args.input_file else None
+    cli_defaults, speaker_map_from_config, config_path = project_config.resolve(
+        explicit=pre_args.config,
+        profile=pre_args.profile,
+        input_file=pre_input_path,
+    )
+
     parser = _build_parser()
+    applied: set[str] = set()
+    ignored: set[str] = set()
+    if cli_defaults:
+        applied, ignored = _apply_config_defaults(parser, cli_defaults)
+
     args = parser.parse_args(argv)
 
     setup_logging(quiet=args.quiet, verbose=args.verbose)
     silence_known_noisy_warnings()
+
+    if config_path:
+        import logging as _logging
+
+        _logging.getLogger("transcript_video.cli").info(
+            "Loaded config %s%s%s",
+            config_path,
+            f" (profile={pre_args.profile})" if pre_args.profile else "",
+            f"; applied: {sorted(applied)}" if applied else "",
+        )
+        if ignored:
+            _logging.getLogger("transcript_video.cli").warning(
+                "Config keys ignored (no matching CLI flag): %s", sorted(ignored)
+            )
 
     # Resolve the input file: from CLI, or from the aligned snapshot when resuming.
     input_file: Path | None = Path(args.input_file) if args.input_file else None
@@ -288,7 +367,9 @@ def main(argv: list[str] | None = None) -> None:
             tags=list(args.tags or []),
             source=args.fm_source,
         ),
-        speaker_map=resolve_speaker_map(args.speaker_map, args.speaker_map_file),
+        speaker_map=resolve_speaker_map(
+            args.speaker_map, args.speaker_map_file, fallback=speaker_map_from_config
+        ),
         resume_from_aligned=resume_path,
     )
 
