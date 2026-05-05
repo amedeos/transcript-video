@@ -3,6 +3,15 @@
 # Builds an image with whisperX + pyannote pre-installed, ready to run
 # `transcribe-video` and `transcript-to-md` on host audio/video files.
 #
+# Base choice: nvcr.io/nvidia/cuda over docker.io to use NVIDIA's own
+# registry (more authoritative than the Docker Hub mirror), and ubi9
+# over ubuntu so the stack is Red Hat-aligned. CUDA tag is 12.8.2 to
+# match PyTorch's `torch==X.Y.Z+cu128` wheel — the version pip installs
+# from PyPI today. Going to CUDA 13 base would mismatch with the
+# wheel's bundled libs; revisit once PyTorch publishes `+cu13x`.
+# UBI10 is not yet an option: NVIDIA only publishes ubi10 tags for
+# CUDA 13.2.1, not for the 12.x line.
+#
 # Build (with podman):
 #     podman build -t transcript-video -f Containerfile .
 #
@@ -29,32 +38,40 @@
 # The HuggingFace cache is shared with the host so the diarization model
 # is downloaded only once across runs.
 
-FROM docker.io/nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+FROM nvcr.io/nvidia/cuda:12.8.2-cudnn-runtime-ubi9
 
-ARG DEBIAN_FRONTEND=noninteractive
-
-# Tooling: Python 3.12 (via deadsnakes), ffmpeg (mandatory for whisperX
-# audio loading), curl (for the uv installer), and a small set of build
-# helpers. Then clean up apt lists to keep the image lean.
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        software-properties-common \
-        ca-certificates \
-        curl && \
-    add-apt-repository -y ppa:deadsnakes/ppa && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
+# Tooling: Python 3.12 (UBI9 ships it as a direct package since 9.4),
+# curl + xz (for fetching the static ffmpeg build), tar (for extraction).
+# UBI9 does NOT include ffmpeg by default — it's omitted from RHEL/UBI
+# for licensing reasons. We pull a static GPL build from John Van
+# Sickle's canonical mirror; single binary, no system deps.
+RUN dnf install -y --setopt=install_weak_deps=False \
         python3.12 \
-        python3.12-venv \
-        python3.12-dev \
-        ffmpeg && \
-    rm -rf /var/lib/apt/lists/* && \
-    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
-    update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
+        python3.12-devel \
+        curl \
+        tar \
+        xz && \
+    dnf clean all && \
+    rm -rf /var/cache/dnf
 
-# uv is the primary package manager for this project; falling back to pip
-# would also work. Installed into /usr/local/bin so it's on $PATH for any
-# user.
+# Make `python` and `python3` resolve to 3.12 so uv/pip helpers work
+# without explicit version selection.
+RUN ln -sf /usr/bin/python3.12 /usr/local/bin/python3 && \
+    ln -sf /usr/bin/python3.12 /usr/local/bin/python
+
+# Static ffmpeg build (johnvansickle.com is the canonical mirror linked
+# from the official ffmpeg site).
+RUN curl -fsSL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+        -o /tmp/ffmpeg.tar.xz && \
+    mkdir -p /tmp/ffmpeg && \
+    tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg --strip-components=1 && \
+    install -m 0755 /tmp/ffmpeg/ffmpeg /usr/local/bin/ffmpeg && \
+    install -m 0755 /tmp/ffmpeg/ffprobe /usr/local/bin/ffprobe && \
+    rm -rf /tmp/ffmpeg /tmp/ffmpeg.tar.xz
+
+# uv is the primary package manager for this project (pip still works
+# as a fallback). Installed under /usr/local/bin so it's on $PATH for
+# any user.
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 
 WORKDIR /opt/transcript-video
