@@ -47,5 +47,5 @@ jobs:
       - name: Lint with ruff
         run: ruff check src/ tests/
 
-      - name: Run pytest
-        run: pytest
+      - name: Run pytest (excluding integration tests)
+        run: pytest -m "not integration"

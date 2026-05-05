@@ -52,3 +52,8 @@ class RunConfig:
     output: OutputConfig = field(default_factory=OutputConfig)
     frontmatter: FrontmatterConfig = field(default_factory=FrontmatterConfig)
     speaker_map: dict[str, str] = field(default_factory=dict)
+
+    # Path to a previously-saved ``*_transcript.aligned.json`` to resume from.
+    # When set, ASR + alignment are skipped and the pipeline jumps straight to
+    # diarization (if enabled) and the final outputs.
+    resume_from_aligned: Path | None = None

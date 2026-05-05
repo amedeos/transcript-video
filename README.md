@@ -15,6 +15,9 @@ This project is the English-language successor of [transcript-italian-video](htt
 - **Output policy reversal**: JSON is always written; SRT, TXT, and Markdown are opt-in.
 - **Markdown export with YAML frontmatter and speaker headings** (`--md`), including an inline or sidecar speaker-name map.
 - **Re-render path**: a separate `transcript-to-md` binary regenerates the Markdown from an existing JSON without loading any model.
+- **Pre-flight checks** (`--check`): catch missing ffmpeg, bad HF token, or gated-model access in seconds — before paying the GPU bill.
+- **Resumable pipeline** (`--resume-from-aligned`): an aligned snapshot is saved before diarization so a downstream failure never wastes the slow ASR + alignment work.
+- **Per-speaker stats** in the JSON (talk time, percentage, turns) and a `transcript-to-md --list-speakers` overview to help with mapping labels to names.
 
 ## Requirements
 
@@ -139,6 +142,31 @@ transcribe-video lecture.mp4 --no-diarize --txt --srt
 |------|-------------|
 | `--anti-loop` | `condition_on_previous_text=False`, `compression_ratio_threshold=2.0`, `no_speech_threshold=0.5` — apply when you observe Whisper's cyclic hallucinations |
 
+**Verbosity**
+
+| Flag | Description |
+|------|-------------|
+| `-q`, `--quiet` | Suppress info-level output; only warnings and errors. |
+| `-v`, `--verbose` | Enable debug-level output (per-segment ASR progress). |
+
+**Pre-flight checks**
+
+By default a pre-flight runs at the start of every transcription. It validates ffmpeg / CUDA / HF token / gated-model access / whisperX API in 1–2 seconds, before the model is loaded.
+
+| Flag | Description |
+|------|-------------|
+| `--check` | Run only the pre-flight (with network) and exit 0/1. Useful before kicking off a long run. |
+| `--no-check` | Skip the default pre-flight (escape hatch). |
+| `--offline-check` | Skip the network parts (HF validity + gated-model access). |
+
+**Resume / cache**
+
+After alignment, an `*_transcript.aligned.json` snapshot is written automatically when diarization is enabled. If the diarize step fails for any reason, the costly ASR + alignment work is preserved and you can resume:
+
+| Flag | Description |
+|------|-------------|
+| `--resume-from-aligned PATH` | Skip ASR + alignment; load the snapshot, run diarization, write outputs. The source video path is read from the snapshot if not given as a positional. |
+
 **Diarization**
 
 | Flag | Description |
@@ -187,6 +215,26 @@ transcript-to-md PATH/TO/foo_transcript.json \
 | `--speaker-map "..."` / `--speaker-map-file PATH` | Same as `transcribe-video` |
 | `--date`, `--tag`, `--source` | Frontmatter overrides |
 | `--merge-gap-seconds FLOAT` | Merge consecutive same-speaker segments whose silent gap is at most this many seconds (default `1.5`; `0` disables merging) |
+| `--list-speakers` | Print a per-speaker overview (label, name, duration, %, turns, first words) and exit without writing Markdown. Use this to figure out who is who before filling in `--speaker-map`. |
+| `-q`, `--quiet` / `-v`, `--verbose` | Output verbosity. |
+
+#### Speaker-mapping workflow
+
+```bash
+# 1. Inspect to see who said what (no MD written):
+transcript-to-md meeting_transcript.json --list-speakers
+
+# Output (example):
+# Label       Name        Duration         %  Turns  First words
+# ----------  ----------  --------  --------  -----  ------------------------------------------
+# SPEAKER_00  SPEAKER_00  00:28:30     59.0%     47  Allora oggi parliamo della migrazione...
+# SPEAKER_01  SPEAKER_01  00:08:12     17.0%     12  Sì una domanda io ce l'ho a me...
+
+# 2. Now you know who is who → re-render with the map:
+transcript-to-md meeting_transcript.json \
+  --speaker-map "SPEAKER_00=Amedeo,SPEAKER_01=Marco" \
+  --tag openshift --tag retro
+```
 
 ## Outputs
 

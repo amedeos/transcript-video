@@ -1,8 +1,10 @@
-"""Shared utilities: timestamp formatting and small file helpers."""
+"""Shared utilities: timestamp formatting, file helpers, logging, warning filters."""
 
 from __future__ import annotations
 
+import logging
 import sys
+import warnings
 from pathlib import Path
 
 
@@ -37,6 +39,63 @@ def format_timestamp_short(seconds: float) -> str:
     minutes = int(seconds // 60)
     secs = int(seconds % 60)
     return f"[{minutes:02d}:{secs:02d}]"
+
+
+def silence_known_noisy_warnings() -> None:
+    """Hide third-party warnings that are not actionable for this tool.
+
+    These all originate from the pyannote / torchcodec / lightning stack and
+    do not indicate problems with our pipeline:
+
+    - **torchcodec / ffmpeg version mismatch**: torchcodec supports ffmpeg 4-7
+      and warns loudly on ffmpeg ≥ 8. We don't use torchcodec — whisperX loads
+      audio through ffmpeg directly via subprocess, which is exactly the
+      fallback path the warning describes. Hiding it removes a 20-line
+      paragraph that confuses users every run.
+    - **TF32 disabled**: pyannote turns off TensorFloat-32 for reproducibility.
+      Informational; no quality impact for transcription/diarization.
+
+    Lightning's checkpoint-upgrade *print* (not a warning) is left visible
+    because it can't be suppressed without redirecting stderr globally and
+    isn't actually noisy enough to justify that.
+    """
+    # Both pyannote warnings are multi-line and start with a leading newline
+    # (they're built from triple-quoted f-strings), so the regex needs the
+    # DOTALL flag (?s) to let `.` match newlines. Without it, the filter
+    # silently never fires — this exact bug shipped on the first attempt.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"(?s).*torchcodec is not installed correctly.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"(?s).*TensorFloat-32.*has been disabled.*",
+    )
+
+
+def setup_logging(*, quiet: bool = False, verbose: bool = False) -> None:
+    """Configure the root logger based on CLI verbosity flags.
+
+    - ``quiet=True`` → WARNING (errors and warnings only).
+    - ``verbose=True`` → DEBUG (per-segment progress visible).
+    - default → INFO (status messages but no per-segment spam).
+
+    Output goes to stderr so it doesn't pollute stdout-redirected outputs.
+    """
+    if quiet:
+        level = logging.WARNING
+    elif verbose:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    handler = logging.StreamHandler(stream=sys.stderr)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    root.addHandler(handler)
+    root.setLevel(level)
 
 
 def read_text_file(path: str | Path, label: str) -> str:

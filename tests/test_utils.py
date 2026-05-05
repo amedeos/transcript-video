@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 
 from transcript_video.utils import (
@@ -9,6 +11,7 @@ from transcript_video.utils import (
     format_timestamp_short,
     format_timestamp_srt,
     read_text_file,
+    silence_known_noisy_warnings,
 )
 
 
@@ -65,6 +68,44 @@ class TestFormatTimestampShort:
     )
     def test_typical(self, seconds, expected):
         assert format_timestamp_short(seconds) == expected
+
+
+class TestSilenceKnownNoisyWarnings:
+    # Real warning text from pyannote.audio: triple-quoted f-string that begins
+    # with a newline. The filter must handle this multiline shape, otherwise
+    # `.` in the default-flag regex doesn't span the leading "\n" and the
+    # filter silently does nothing.
+    REAL_TORCHCODEC_MESSAGE = (
+        "\ntorchcodec is not installed correctly so built-in audio decoding "
+        "will fail. Solutions are:\n* use audio preloaded in-memory ..."
+    )
+    REAL_TF32_MESSAGE = (
+        "TensorFloat-32 (TF32) has been disabled as it might lead to "
+        "reproducibility issues and lower accuracy.\nIt can be re-enabled "
+        "by calling\n   >>> import torch"
+    )
+
+    def test_torchcodec_warning_silenced(self):
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.resetwarnings()
+            silence_known_noisy_warnings()
+            warnings.warn(self.REAL_TORCHCODEC_MESSAGE, UserWarning, stacklevel=2)
+            assert not captured
+
+    def test_tf32_warning_silenced(self):
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.resetwarnings()
+            silence_known_noisy_warnings()
+            warnings.warn(self.REAL_TF32_MESSAGE, UserWarning, stacklevel=2)
+            assert not captured
+
+    def test_unrelated_warnings_pass_through(self):
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.resetwarnings()
+            warnings.simplefilter("always")
+            silence_known_noisy_warnings()
+            warnings.warn("something else entirely", UserWarning, stacklevel=2)
+            assert any("something else" in str(w.message) for w in captured)
 
 
 class TestReadTextFile:
