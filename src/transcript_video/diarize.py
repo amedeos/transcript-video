@@ -9,6 +9,7 @@ Resolves the HuggingFace token from (in order):
 
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -41,7 +42,9 @@ def _resolve_diarization_api():
 
     whisperX moved the diarization pipeline between top-level and ``whisperx.diarize``
     over its 3.x history; we accept both layouts so the package works against the
-    pinned ``>=3.1`` range without a hard version lock.
+    pinned ``>=3.1`` range without a hard version lock. Note: the bare
+    ``whisperx.diarize.Pipeline`` symbol (re-exported pyannote class) is not a
+    valid fallback — its ``__init__`` signature is incompatible.
     """
     try:
         import whisperx
@@ -53,12 +56,7 @@ def _resolve_diarization_api():
         )
         sys.exit(1)
 
-    pipeline_cls = None
-    for attr in ("DiarizationPipeline", "Pipeline"):
-        candidate = getattr(getattr(whisperx, "diarize", None), attr, None)
-        if candidate is not None:
-            pipeline_cls = candidate
-            break
+    pipeline_cls = getattr(getattr(whisperx, "diarize", None), "DiarizationPipeline", None)
     if pipeline_cls is None:
         pipeline_cls = getattr(whisperx, "DiarizationPipeline", None)
     if pipeline_cls is None:
@@ -89,6 +87,33 @@ def _resolve_diarization_api():
     return pipeline_cls, assign_fn
 
 
+def _build_pipeline_init_kwargs(pipeline_cls, hf_token: str, device: str) -> dict[str, Any]:
+    """Build the ``__init__`` kwargs for ``DiarizationPipeline`` adapting to its signature.
+
+    whisperX renamed ``use_auth_token`` to ``token`` to match the newer
+    ``huggingface_hub`` convention; we accept either by inspecting the
+    constructor signature.
+    """
+    try:
+        params = inspect.signature(pipeline_cls.__init__).parameters
+    except (TypeError, ValueError):
+        params = {}
+
+    init_kwargs: dict[str, Any] = {}
+    for token_arg in ("token", "use_auth_token", "auth_token"):
+        if token_arg in params:
+            init_kwargs[token_arg] = hf_token
+            break
+    else:
+        # Fall back: surface the token via env var so pyannote/HF can pick it up.
+        os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", hf_token)
+
+    if "device" in params:
+        init_kwargs["device"] = device
+
+    return init_kwargs
+
+
 def diarize_and_assign(
     aligned: dict[str, Any],
     audio,
@@ -113,7 +138,8 @@ def diarize_and_assign(
         sys.exit(1)
 
     pipeline_cls, assign_fn = _resolve_diarization_api()
-    diarize_pipeline = pipeline_cls(use_auth_token=hf_token, device=device)
+    init_kwargs = _build_pipeline_init_kwargs(pipeline_cls, hf_token, device)
+    diarize_pipeline = pipeline_cls(**init_kwargs)
 
     diarize_kwargs: dict[str, Any] = {}
     if num_speakers is not None:
