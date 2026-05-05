@@ -36,6 +36,59 @@ def resolve_hf_token(cli_token: str | None) -> str | None:
     return None
 
 
+def _resolve_diarization_api():
+    """Resolve ``DiarizationPipeline`` and ``assign_word_speakers`` across whisperX versions.
+
+    whisperX moved the diarization pipeline between top-level and ``whisperx.diarize``
+    over its 3.x history; we accept both layouts so the package works against the
+    pinned ``>=3.1`` range without a hard version lock.
+    """
+    try:
+        import whisperx
+    except ImportError:
+        print(
+            "Error: whisperx is not installed. Diarization requires the full "
+            "pipeline; install with `uv pip install -e .`.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    pipeline_cls = None
+    for attr in ("DiarizationPipeline", "Pipeline"):
+        candidate = getattr(getattr(whisperx, "diarize", None), attr, None)
+        if candidate is not None:
+            pipeline_cls = candidate
+            break
+    if pipeline_cls is None:
+        pipeline_cls = getattr(whisperx, "DiarizationPipeline", None)
+    if pipeline_cls is None:
+        try:
+            from whisperx.diarize import DiarizationPipeline as pipeline_cls  # type: ignore
+        except ImportError:
+            print(
+                "Error: could not locate DiarizationPipeline in the installed whisperx package. "
+                "Try `uv pip install --upgrade whisperx` (or pin to a version that exposes it).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    assign_fn = getattr(whisperx, "assign_word_speakers", None) or getattr(
+        getattr(whisperx, "diarize", None), "assign_word_speakers", None
+    )
+    if assign_fn is None:
+        try:
+            from whisperx.diarize import assign_word_speakers as assign_fn  # type: ignore
+        except ImportError:
+            print(
+                "Error: could not locate assign_word_speakers in the installed whisperx package. "
+                "Try `uv pip install --upgrade whisperx`.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    return pipeline_cls, assign_fn
+
+
 def diarize_and_assign(
     aligned: dict[str, Any],
     audio,
@@ -59,17 +112,8 @@ def diarize_and_assign(
         )
         sys.exit(1)
 
-    try:
-        import whisperx
-    except ImportError:
-        print(
-            "Error: whisperx is not installed. Diarization requires the full "
-            "pipeline; install with `uv pip install -e .`.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    diarize_pipeline = whisperx.DiarizationPipeline(use_auth_token=hf_token, device=device)
+    pipeline_cls, assign_fn = _resolve_diarization_api()
+    diarize_pipeline = pipeline_cls(use_auth_token=hf_token, device=device)
 
     diarize_kwargs: dict[str, Any] = {}
     if num_speakers is not None:
@@ -80,7 +124,7 @@ def diarize_and_assign(
         diarize_kwargs["max_speakers"] = max_speakers
 
     diarize_segments = diarize_pipeline(audio, **diarize_kwargs)
-    return whisperx.assign_word_speakers(diarize_segments, aligned)
+    return assign_fn(diarize_segments, aligned)
 
 
 def count_unique_speakers(segments: list[dict[str, Any]]) -> int:
