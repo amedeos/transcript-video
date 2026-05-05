@@ -36,18 +36,18 @@ transcribe-video INPUT [options]
 transcript-to-md PATH/TO/foo_transcript.json [options]
 ```
 
-## Architecture: the four invariants
+## Architecture: the invariants
 
 These are non-obvious from the code and **must hold across any refactor**.
 
-### 1. `markdown.py` must stay torch-free
+### 1. The torch-free re-render path
 
-`transcript-to-md` exists so users can re-render Markdown from a saved JSON without a GPU or model download. It transitively imports only:
+`transcript-to-md` exists so users can re-render Markdown from a saved JSON without a GPU or model download. The protected set (enforced by `tests/test_torch_free.py`):
 
-- `markdown.py` → `speakers.py` → `utils.py`
-- stdlib + PyYAML
+- `utils.py`, `speakers.py`, `stats.py`, `markdown.py`, `writers.py`, `cli_to_md.py`
+- Allowed deps: stdlib + PyYAML
 
-Do **not** add imports from `asr`, `diarize`, `pipeline`, `whisperx`, `torch`, `pyannote`, `transformers`, `ctranslate2`, or `faster_whisper` to those four modules. If you need a helper from there, lift it into `utils.py` instead. There is a smoke test for this: see "Verification" in the original plan.
+Do **not** add imports from `asr`, `diarize`, `pipeline`, `preflight`, `whisperx`, `torch`, `pyannote`, `transformers`, `ctranslate2`, or `faster_whisper` to those modules. If you need a helper from there, lift it into `utils.py` / `stats.py` instead.
 
 ### 2. JSON is the contract between the two binaries
 
@@ -65,6 +65,21 @@ Don't restore the old behavior "for convenience".
 ### 4. Default language is autodetect
 
 The reference project defaulted to `--language it`. **This project does not** — the user explicitly wanted no default. `--language` only sets a forced override; `parameters.language_forced` in the JSON is `null` whenever autodetect was used.
+
+### 5. Two-stage pipeline + `stage` field
+
+The pipeline writes two persistence layers:
+
+- `*_transcript.aligned.json` — written immediately after alignment, only when diarization is enabled. The free safety net: if diarization fails, ASR + alignment work is preserved.
+- `*_transcript.json` — the canonical output, written after the full pipeline.
+
+Both share the same schema. The top-level `stage` field discriminates them (`"aligned"` vs `"complete"`). When refactoring `_build_payload()`, keep both stages going through the same builder so they stay structurally identical.
+
+`--resume-from-aligned PATH` skips ASR + alignment and feeds the snapshot straight to diarization. The aligned snapshot is the only legitimate input form for resuming — don't accept `*_transcript.json` for resume (its segments already carry speakers, so re-diarizing would clobber them).
+
+### 6. Pre-flight runs by default
+
+`preflight.run_preflight(config)` is invoked at the start of every transcription unless `--no-check` is passed. The pre-flight tests we hit on real machines (HF token validity, gated-model access, whisperX API resolution) catch failures in 1–2 seconds instead of 5 minutes. When adding a new external dependency to the pipeline, add a pre-flight check for it.
 
 ## Reference-project parity
 
