@@ -83,10 +83,10 @@ JSON is always produced. SRT, TXT, and Markdown are opt-in.
 
 ```bash
 # Minimal: autodetect language, JSON only, diarization on
-transcribe-video meeting.mp4
+transcribe-video video.mp4
 
 # All artifacts
-transcribe-video meeting.mp4 --srt --txt --md
+transcribe-video video.mp4 --srt --txt --md
 
 # Force English, higher-accuracy beam, anti-loop mitigations
 transcribe-video interview.mp4 --language en --beam_size 10 --anti-loop
@@ -97,7 +97,7 @@ transcribe-video podcast.mp4 \
   --hotwords "Anthropic Claude faster-whisper"
 
 # Diarization with bounded speaker count + named speakers + frontmatter
-transcribe-video meeting.mp4 --md \
+transcribe-video video.mp4 --md \
   --min-speakers 2 --max-speakers 4 \
   --speaker-map "SPEAKER_00=Amedeo,SPEAKER_01=Tizio" \
   --tag openshift --tag ovn-kubernetes --tag troubleshooting
@@ -237,7 +237,7 @@ transcript-to-md PATH/TO/foo_transcript.json \
 
 ```bash
 # 1. Inspect to see who said what (no MD written):
-transcript-to-md meeting_transcript.json --list-speakers
+transcript-to-md video_transcript.json --list-speakers
 
 # Output (example):
 # Label       Name        Duration         %  Turns  First words
@@ -246,7 +246,7 @@ transcript-to-md meeting_transcript.json --list-speakers
 # SPEAKER_01  SPEAKER_01  00:08:12     17.0%     12  Sì una domanda io ce l'ho a me...
 
 # 2. Now you know who is who → re-render with the map:
-transcript-to-md meeting_transcript.json \
+transcript-to-md video_transcript.json \
   --speaker-map "SPEAKER_00=Amedeo,SPEAKER_01=Marco" \
   --tag openshift --tag retro
 ```
@@ -260,7 +260,7 @@ All outputs default to the input directory with the suffix `_transcript`. With `
 ```jsonc
 {
   "schema_version": 1,
-  "source_file": "/abs/path/meeting.mp4",
+  "source_file": "/abs/path/video.mp4",
   "transcribed_at": "2026-05-05T10:30:00",
   "parameters": {
     "backend": "whisperx",
@@ -362,7 +362,7 @@ Resolution order:
 Activate a profile with `--profile NAME`:
 
 ```bash
-transcribe-video meeting.mp4 --profile meeting --md
+transcribe-video video.mp4 --profile meeting --md
 ```
 
 CLI flags always override the config. The config provides defaults; it never restricts.
@@ -387,12 +387,34 @@ podman run --rm \
   -v "$(pwd):/data:Z" \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface:Z" \
   transcript-video \
-  meeting.mp4 --md --tag openshift
+  video.mp4 --md --tag openshift
 ```
 
 The container's working directory is `/data`, so paths in the command line are relative to the host directory bind-mounted there. The HuggingFace cache is shared with the host so the diarization model is downloaded once across runs.
 
 For CPU-only execution, drop `--device nvidia.com/gpu=all` and pass `--device cpu` to `transcribe-video` inside the container (slow — only sensible for short clips or smoke tests).
+
+### Rootless podman: keep host groups for GPU access
+
+Out of the box, rootless podman maps your user to `nobody` inside the container, so the `/dev/nvidia*` devices appear unreadable and CUDA fails with `no CUDA-capable device is detected` (the diagnostic in the container shows `nvidia-smi: Failed to initialize NVML: Insufficient Permissions` and `ctranslate2.get_cuda_device_count() == 0`). Add `--group-add keep-groups` so the container inherits your host's `video` / `render` groups and keeps device-file access:
+
+```bash
+podman run --rm \
+  --device nvidia.com/gpu=all \
+  --security-opt=label=disable \
+  --group-add keep-groups \
+  -e HF_TOKEN="$(cat ~/.cache/huggingface/token)" \
+  -v "$(pwd):/data" \
+  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+  transcript-video \
+  video.mp4 --md
+```
+
+Make sure your host user is in the right groups (`groups | grep -E 'video|render'`); add yourself with `sudo usermod -aG video,render $USER` and re-login if you aren't. Running rootful (`sudo podman run ...`) is an alternative that sidesteps the namespace mapping entirely.
+
+### HuggingFace token in the container
+
+If you authenticated on the host with `huggingface-cli login`, the token lives in `~/.cache/huggingface/token`, not in `$HF_TOKEN`. Pass it explicitly with `-e HF_TOKEN="$(cat ~/.cache/huggingface/token)"`, or bind-mount the whole cache directory (as the example above does) — the latter also avoids re-downloading the diarization model on every run.
 
 ## Troubleshooting
 
