@@ -91,6 +91,7 @@ class TestCheckWhisperxApi:
             pass
 
         fake_whisperx.DiarizationPipeline = FakePipeline
+        fake_whisperx.assign_word_speakers = lambda diarized, aligned: aligned
         monkeypatch.setitem(sys.modules, "whisperx", fake_whisperx)
         r = check_whisperx_api()
         assert r.ok
@@ -103,6 +104,7 @@ class TestCheckWhisperxApi:
             pass
 
         fake_diarize.DiarizationPipeline = FakePipeline
+        fake_diarize.assign_word_speakers = lambda diarized, aligned: aligned
         fake_whisperx.diarize = fake_diarize
         monkeypatch.setitem(sys.modules, "whisperx", fake_whisperx)
         monkeypatch.setitem(sys.modules, "whisperx.diarize", fake_diarize)
@@ -115,6 +117,51 @@ class TestCheckWhisperxApi:
         monkeypatch.setitem(sys.modules, "whisperx", fake_whisperx)
         r = check_whisperx_api()
         assert not r.ok
+
+    def test_submodule_only_via_explicit_import(self, monkeypatch):
+        """Regression: real whisperX ≥3.4 doesn't auto-import .diarize on `import whisperx`.
+
+        ``whisperx.diarize`` is missing from the parent module's attributes
+        until something does ``from whisperx.diarize import ...`` — at which
+        point Python registers the submodule. The preflight must trigger that
+        import itself rather than relying on attribute lookup.
+        """
+        fake_whisperx = types.ModuleType("whisperx")
+        fake_diarize = types.ModuleType("whisperx.diarize")
+
+        class FakeDP:
+            pass
+
+        def fake_assign(diarized, aligned):
+            return aligned
+
+        fake_diarize.DiarizationPipeline = FakeDP
+        fake_diarize.assign_word_speakers = fake_assign
+
+        # Crucially: the parent module does NOT expose `.diarize` as an attribute,
+        # but the submodule IS registered in sys.modules so `from whisperx.diarize
+        # import ...` succeeds.
+        monkeypatch.setitem(sys.modules, "whisperx", fake_whisperx)
+        monkeypatch.setitem(sys.modules, "whisperx.diarize", fake_diarize)
+        assert not hasattr(fake_whisperx, "diarize")  # confirm the failure mode
+
+        r = check_whisperx_api()
+        assert r.ok, r.message
+
+    def test_assign_word_speakers_missing(self, monkeypatch):
+        """DiarizationPipeline resolves but assign_word_speakers is gone."""
+        fake_whisperx = types.ModuleType("whisperx")
+
+        class FakeDP:
+            pass
+
+        fake_whisperx.DiarizationPipeline = FakeDP
+        # Note: no assign_word_speakers anywhere.
+        monkeypatch.setitem(sys.modules, "whisperx", fake_whisperx)
+        # Make the explicit submodule import fail too.
+        monkeypatch.setitem(sys.modules, "whisperx.diarize", None)
+        r = check_whisperx_api()
+        assert not r.ok and "assign_word_speakers" in r.message
 
 
 class TestCheckHfToken:

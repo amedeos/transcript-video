@@ -61,10 +61,56 @@ def check_cuda(device_request: str | None) -> CheckResult:
     return CheckResult("cuda", True, "not available; pipeline will fall back to CPU (slower)")
 
 
-def check_whisperx_api() -> CheckResult:
-    """Confirm whisperX is importable and ``DiarizationPipeline`` resolves."""
+def _resolve_pipeline_class():
+    """Best-effort lookup of ``DiarizationPipeline`` mirroring :func:`diarize._resolve_diarization_api`.
+
+    Returns the class or ``None``. Tries (1) attribute on ``whisperx.diarize``,
+    (2) attribute on ``whisperx`` (older API), (3) explicit submodule import
+    (newer whisperX often does **not** eagerly load the ``diarize`` submodule
+    on ``import whisperx``, so the attribute is missing until forced).
+    """
     try:
         import whisperx
+    except ImportError:
+        return None
+
+    pipeline_cls = getattr(
+        getattr(whisperx, "diarize", None), "DiarizationPipeline", None
+    ) or getattr(whisperx, "DiarizationPipeline", None)
+    if pipeline_cls is not None:
+        return pipeline_cls
+
+    try:
+        from whisperx.diarize import DiarizationPipeline  # noqa: PLC0415
+    except ImportError:
+        return None
+    return DiarizationPipeline
+
+
+def _resolve_assign_fn():
+    """Companion of :func:`_resolve_pipeline_class` for ``assign_word_speakers``."""
+    try:
+        import whisperx
+    except ImportError:
+        return None
+
+    fn = getattr(whisperx, "assign_word_speakers", None) or getattr(
+        getattr(whisperx, "diarize", None), "assign_word_speakers", None
+    )
+    if fn is not None:
+        return fn
+
+    try:
+        from whisperx.diarize import assign_word_speakers
+    except ImportError:
+        return None
+    return assign_word_speakers
+
+
+def check_whisperx_api() -> CheckResult:
+    """Confirm whisperX is importable and the diarization API can be resolved."""
+    try:
+        import whisperx  # noqa: F401
     except ImportError as e:
         return CheckResult(
             "whisperx_api",
@@ -72,10 +118,7 @@ def check_whisperx_api() -> CheckResult:
             f"whisperx not importable: {e}. Install with `uv pip install -e .`.",
         )
 
-    pipeline_cls = getattr(
-        getattr(whisperx, "diarize", None), "DiarizationPipeline", None
-    ) or getattr(whisperx, "DiarizationPipeline", None)
-
+    pipeline_cls = _resolve_pipeline_class()
     if pipeline_cls is None:
         return CheckResult(
             "whisperx_api",
@@ -83,7 +126,17 @@ def check_whisperx_api() -> CheckResult:
             "whisperx is installed but DiarizationPipeline cannot be resolved; "
             "try `uv pip install --upgrade whisperx`",
         )
-    return CheckResult("whisperx_api", True, "DiarizationPipeline resolved")
+
+    assign_fn = _resolve_assign_fn()
+    if assign_fn is None:
+        return CheckResult(
+            "whisperx_api",
+            False,
+            "whisperx exposes DiarizationPipeline but not assign_word_speakers; "
+            "try `uv pip install --upgrade whisperx`",
+        )
+
+    return CheckResult("whisperx_api", True, "DiarizationPipeline + assign_word_speakers resolved")
 
 
 def check_hf_token(token: str | None, *, network: bool) -> CheckResult:
