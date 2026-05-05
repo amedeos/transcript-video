@@ -94,6 +94,10 @@ def _build_payload(
 ) -> dict[str, Any]:
     """Build the canonical JSON payload. Used for both aligned and complete stages."""
     duration_seconds = float(segments[-1].get("end") or 0.0) if segments else 0.0
+    # Annotate segments with `suspect` / `suspect_reasons` before computing the
+    # per-speaker breakdown so num_suspect picks them up. Mutates segments in
+    # place; idempotent on resume because the same thresholds always apply.
+    stats_mod.mark_suspect_segments(segments)
     return {
         "schema_version": 1,
         "stage": stage,
@@ -121,6 +125,10 @@ def _build_payload(
                 "min_speakers": config.diarization.min_speakers,
                 "max_speakers": config.diarization.max_speakers,
             },
+            "suspect_thresholds": {
+                "avg_logprob": stats_mod.DEFAULT_AVG_LOGPROB_THRESHOLD,
+                "no_speech_prob": stats_mod.DEFAULT_NO_SPEECH_PROB_THRESHOLD,
+            },
         },
         "audio_info": {
             "language_detected": detected_language,
@@ -130,6 +138,7 @@ def _build_payload(
         "stats": {
             "num_segments": len(segments),
             "num_speakers": stats_mod.count_unique_speakers(segments),
+            "num_suspect": stats_mod.count_suspect_segments(segments),
             "processing_seconds": processing_seconds,
             "speakers": stats_mod.compute_speaker_stats(segments),
         },
