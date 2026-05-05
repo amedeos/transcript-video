@@ -209,11 +209,4 @@ def diarize_and_assign(
     return assign_fn(diarize_segments, aligned)
 
 
-def count_unique_speakers(segments: list[dict[str, Any]]) -> int:
-    """Count distinct non-empty speaker labels across ``segments``."""
-    seen: set[str] = set()
-    for seg in segments:
-        label = seg.get("speaker")
-        if label:
-            seen.add(label)
-    return len(seen)
+from .stats import count_unique_speakers  # noqa: E402,F401  (re-export for backward compat)

@@ -65,3 +65,6 @@ minversion = "8.0"
 addopts = ["-ra", "--strict-markers"]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "integration: tests that require whisperX / torch / pyannote installed; skipped by default in CI (pass `-m integration` to run them locally).",
+]

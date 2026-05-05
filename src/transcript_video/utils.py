@@ -1,7 +1,8 @@
-"""Shared utilities: timestamp formatting and small file helpers."""
+"""Shared utilities: timestamp formatting, file helpers, and logging setup."""
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -37,6 +38,31 @@ def format_timestamp_short(seconds: float) -> str:
     minutes = int(seconds // 60)
     secs = int(seconds % 60)
     return f"[{minutes:02d}:{secs:02d}]"
+
+
+def setup_logging(*, quiet: bool = False, verbose: bool = False) -> None:
+    """Configure the root logger based on CLI verbosity flags.
+
+    - ``quiet=True`` → WARNING (errors and warnings only).
+    - ``verbose=True`` → DEBUG (per-segment progress visible).
+    - default → INFO (status messages but no per-segment spam).
+
+    Output goes to stderr so it doesn't pollute stdout-redirected outputs.
+    """
+    if quiet:
+        level = logging.WARNING
+    elif verbose:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    handler = logging.StreamHandler(stream=sys.stderr)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    root.addHandler(handler)
+    root.setLevel(level)
 
 
 def read_text_file(path: str | Path, label: str) -> str:

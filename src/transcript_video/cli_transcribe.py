@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from .config import DiarizationConfig, FrontmatterConfig, OutputConfig, RunConfig
 from .pipeline import run_pipeline
+from .preflight import report_results, run_preflight
 from .speakers import resolve_speaker_map
-from .utils import read_text_file
+from .utils import read_text_file, setup_logging
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -32,7 +34,16 @@ Examples:
         """,
     )
 
-    parser.add_argument("input_file", help="Path to the input video/audio file (typically MP4).")
+    parser.add_argument(
+        "input_file",
+        nargs="?",
+        default=None,
+        help=(
+            "Path to the input video/audio file (typically MP4). Optional with --check, or "
+            "with --resume-from-aligned (in which case the source file is taken from the "
+            "aligned snapshot)."
+        ),
+    )
 
     model_group = parser.add_argument_group("Model / device")
     model_group.add_argument("--model", default="large-v3", help="whisperX model name (default: large-v3).")
@@ -76,6 +87,54 @@ Examples:
         help=(
             "Mitigate Whisper's cyclic hallucinations: condition_on_previous_text=False, "
             "compression_ratio_threshold=2.0, no_speech_threshold=0.5."
+        ),
+    )
+
+    verbosity = parser.add_mutually_exclusive_group()
+    verbosity.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Suppress info-level output; only warnings and errors.",
+    )
+    verbosity.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable debug-level output (per-segment ASR progress).",
+    )
+
+    resume_group = parser.add_argument_group("Resume / cache")
+    resume_group.add_argument(
+        "--resume-from-aligned",
+        default=None,
+        help=(
+            "Path to a previously-written *_transcript.aligned.json. Skips ASR + alignment "
+            "and jumps straight to diarization. The source video is taken from the snapshot "
+            "(or override by passing input_file)."
+        ),
+    )
+
+    preflight_group = parser.add_argument_group("Pre-flight checks")
+    preflight_group.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "Run pre-flight checks (ffmpeg, CUDA, HF token, gated-model access, whisperX API) "
+            "and exit. Useful before paying for a long ASR run."
+        ),
+    )
+    preflight_group.add_argument(
+        "--no-check",
+        action="store_true",
+        help="Skip the default pre-flight that runs at the start of every transcription.",
+    )
+    preflight_group.add_argument(
+        "--offline-check",
+        action="store_true",
+        help=(
+            "Skip the network-dependent parts of the pre-flight (HF token validity and "
+            "gated-model access). Implied when no internet is available."
         ),
     )
 
@@ -173,8 +232,32 @@ def main(argv: list[str] | None = None) -> None:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
+    setup_logging(quiet=args.quiet, verbose=args.verbose)
+
+    # Resolve the input file: from CLI, or from the aligned snapshot when resuming.
+    input_file: Path | None = Path(args.input_file) if args.input_file else None
+    resume_path: Path | None = Path(args.resume_from_aligned) if args.resume_from_aligned else None
+
+    if input_file is None and resume_path is not None:
+        # Pull source_file from the snapshot.
+        import json as _json
+
+        try:
+            with open(resume_path, encoding="utf-8") as _f:
+                _snap = _json.load(_f)
+            source = _snap.get("source_file")
+            if source:
+                input_file = Path(source)
+        except OSError as e:
+            parser.error(f"could not read --resume-from-aligned snapshot: {e}")
+
+    if not args.check and input_file is None:
+        parser.error("input_file is required (omit only with --check, or with --resume-from-aligned and a snapshot that records source_file)")
+
     config = RunConfig(
-        input_file=Path(args.input_file),
+        # When --check is the only thing requested, input_file may be missing;
+        # the placeholder is never read because we exit before run_pipeline.
+        input_file=input_file if input_file else Path("/dev/null"),
         model=args.model,
         beam_size=args.beam_size,
         device=None if args.device == "auto" else args.device,
@@ -205,7 +288,25 @@ def main(argv: list[str] | None = None) -> None:
             source=args.fm_source,
         ),
         speaker_map=resolve_speaker_map(args.speaker_map, args.speaker_map_file),
+        resume_from_aligned=resume_path,
     )
+
+    # --check: run only the pre-flight (with network) and exit 0/1.
+    if args.check:
+        results = run_preflight(config, network=not args.offline_check)
+        ok = report_results(results)
+        sys.exit(0 if ok else 1)
+
+    # Default pre-flight on every run, unless --no-check.
+    if not args.no_check:
+        results = run_preflight(config, network=not args.offline_check)
+        if not report_results(results):
+            print(
+                "\nPre-flight failed. Fix the issues above or pass --no-check to skip "
+                "(at your own risk).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     run_pipeline(config)
 
