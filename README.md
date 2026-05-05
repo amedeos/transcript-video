@@ -1,5 +1,11 @@
 # transcript-video
 
+[![CI](https://github.com/amedeos/transcript-video/actions/workflows/ci.yml/badge.svg)](https://github.com/amedeos/transcript-video/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](https://www.python.org/downloads/)
+[![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Status: Alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#)
+
 Transcribe and diarize video/audio using [whisperX](https://github.com/m-bain/whisperX) — which combines [faster-whisper](https://github.com/SYSTRAN/faster-whisper) with wav2vec2 forced alignment and [pyannote.audio](https://github.com/pyannote/pyannote-audio) speaker diarization — and emit JSON, SRT, plain text, and a human-readable Markdown transcript with YAML frontmatter.
 
 This project is the English-language successor of [transcript-italian-video](https://github.com/amedeos/transcript-italian-video). It keeps every optimization from the reference (initial prompt, hotwords, anti-loop) and adds:
