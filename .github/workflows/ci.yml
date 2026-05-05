@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # We deliberately avoid `pip install -e .` because that would pull in
+      # whisperX, torch, pyannote and friends (~2 GB). The CI surface here
+      # covers only the torch-free modules + the lint/syntax invariants;
+      # a missing torch import is in fact what `tests/test_torch_free.py`
+      # is designed to verify.
+      - name: Install minimal test dependencies
+        run: python -m pip install --upgrade pip "pyyaml>=6" "ruff>=0.5" "pytest>=8"
+
+      - name: Compile-check every module
+        run: python -m compileall -q src/transcript_video
+
+      - name: Lint with ruff
+        run: ruff check src/ tests/
+
+      - name: Run pytest
+        run: pytest

@@ -1,0 +1,9 @@
+# Runtime dependencies. Generated to mirror pyproject.toml for users who
+# prefer plain pip + venv. The canonical source is pyproject.toml; prefer
+# `uv pip install -e .` (or `pip install -e .`) when you can.
+whisperx>=3.1
+pyyaml>=6
+
+# Optional CUDA wheels (uncomment or install the [cuda] extra for GPU runs).
+# nvidia-cublas-cu12
+# nvidia-cudnn-cu12
