@@ -42,6 +42,19 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
+### Running the binaries
+
+`uv pip install` finds `.venv` automatically without activating it, but the installed console scripts (`transcribe-video`, `transcript-to-md`, plus `pytest` / `ruff` from the dev extra) still need their environment active to be on `$PATH`. Two options:
+
+```bash
+# Activate the venv (classic):
+source .venv/bin/activate
+transcribe-video video.mp4
+
+# Or use `uv run` for one-off invocations (no activation):
+uv run transcribe-video video.mp4
+```
+
 ## HuggingFace token (for diarization)
 
 Diarization needs a token. Resolved in this order:
