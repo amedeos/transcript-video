@@ -2,6 +2,16 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Working agreement: never auto-commit
+
+The user reviews and validates every commit individually before it lands. **Do not run `git commit` on your own**, even when:
+
+- a previous instruction said "go ahead and commit" — that approval is one-shot, not a standing license
+- multiple logical units are obviously ready to be split across commits
+- auto mode is active (auto mode covers code changes, not publishing actions)
+
+After completing a change, stage the files explicitly and stop. Show the user a summary of what would be committed and wait for an explicit per-commit "ok" before running `git commit`. If you have several batches of changes, get approval for each batch separately rather than chaining them.
+
 ## What this project is
 
 `transcript-video` is the **English-language successor** of [transcript-italian-video](https://github.com/amedeos/transcript-italian-video). It transcribes and diarizes video/audio using whisperX (faster-whisper + wav2vec2 alignment + pyannote 3.x diarization) and produces JSON / SRT / TXT / Markdown.
