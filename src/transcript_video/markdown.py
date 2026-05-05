@@ -9,6 +9,7 @@ torch / whisperX / pyannote installed.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable
 from datetime import date
 from pathlib import Path
@@ -138,21 +139,75 @@ def render_frontmatter(
     return "\n".join(lines) + "\n"
 
 
+SUSPECT_MARKER = "[?]"
+
+# Sentence boundaries: split on whitespace following ``.``, ``!``, or ``?``.
+# Italian-friendly enough; minor false positives on abbreviations like ``es.``
+# are acceptable given the typical 400-char paragraph budget.
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def split_into_paragraphs(text: str, max_chars: int) -> list[str]:
+    """Split a long block of speaker text into paragraphs at sentence boundaries.
+
+    The algorithm packs whole sentences into paragraphs, starting a new
+    paragraph as soon as adding the next sentence would push the running
+    paragraph past ``max_chars``. The first sentence of each paragraph is
+    always kept whole — a single 600-char sentence stays on its own line
+    rather than being mid-cut.
+
+    ``max_chars <= 0`` disables splitting (returns the input as a single-element
+    list), which is the escape hatch for users who prefer the legacy single-
+    paragraph rendering.
+    """
+    text = text.strip()
+    if not text or max_chars <= 0:
+        return [text] if text else []
+
+    sentences = [s.strip() for s in _SENTENCE_BOUNDARY_RE.split(text) if s.strip()]
+    if not sentences:
+        return [text]
+
+    paragraphs: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for s in sentences:
+        if current and current_len + len(s) > max_chars:
+            paragraphs.append(" ".join(current))
+            current = [s]
+            current_len = len(s)
+        else:
+            current.append(s)
+            current_len += len(s) + 1  # +1 accounts for the joining space.
+    if current:
+        paragraphs.append(" ".join(current))
+    return paragraphs
+
+
 def _group_segments(
-    segments: list[dict[str, Any]], merge_gap_seconds: float
+    segments: list[dict[str, Any]],
+    merge_gap_seconds: float,
+    *,
+    mark_suspect: bool = False,
 ) -> list[dict[str, Any]]:
     """Merge consecutive same-speaker segments separated by <= ``merge_gap_seconds``.
 
     Each output block is a dict with ``start``, ``end``, ``speaker`` (raw label),
     and ``text``. Segments with no speaker label are bucketed under
     :data:`UNKNOWN_SPEAKER`.
+
+    When ``mark_suspect=True``, each segment flagged ``suspect: true`` is
+    prefixed with ``[?]`` *inline* (preserving its position within the merged
+    block) instead of breaking the block. This keeps the speaker's turn
+    coherent while making the unreliable spans visible at a glance.
     """
     blocks: list[dict[str, Any]] = []
     for seg in segments:
         speaker = seg.get("speaker") or UNKNOWN_SPEAKER
-        text = (seg.get("text") or "").strip()
-        if not text:
+        raw_text = (seg.get("text") or "").strip()
+        if not raw_text:
             continue
+        text = f"{SUSPECT_MARKER} {raw_text}" if mark_suspect and seg.get("suspect") else raw_text
         start = float(seg.get("start") or 0.0)
         end = float(seg.get("end") or start)
 
@@ -173,9 +228,17 @@ def render_body(
     *,
     speaker_map: dict[str, str],
     merge_gap_seconds: float = 1.5,
+    mark_suspect: bool = False,
+    paragraph_chars: int = 400,
 ) -> str:
-    """Render the speaker-labeled Markdown body."""
-    blocks = _group_segments(segments, merge_gap_seconds)
+    """Render the speaker-labeled Markdown body.
+
+    ``paragraph_chars`` controls how aggressively long speaker blocks are
+    broken into paragraphs at sentence boundaries: a new paragraph starts
+    as soon as the running paragraph would exceed this many characters.
+    Pass ``0`` to disable splitting (legacy single-paragraph behavior).
+    """
+    blocks = _group_segments(segments, merge_gap_seconds, mark_suspect=mark_suspect)
     if not blocks:
         return ""
 
@@ -184,7 +247,8 @@ def render_body(
         timestamp = format_timestamp_hms(block["start"])
         name = display_name(block["speaker"], speaker_map)
         parts.append(f"## [{timestamp}] {name}")
-        parts.append(block["text"])
+        paragraphs = split_into_paragraphs(block["text"], paragraph_chars)
+        parts.append("\n\n".join(paragraphs) if paragraphs else block["text"])
         parts.append("")
     return "\n".join(parts).rstrip() + "\n"
 
@@ -197,6 +261,8 @@ def render_markdown(
     tags: list[str] | None = None,
     fm_source: str | None = None,
     merge_gap_seconds: float = 1.5,
+    mark_suspect: bool = False,
+    paragraph_chars: int = 400,
 ) -> str:
     """Render the full Markdown document (frontmatter + body)."""
     speaker_map = speaker_map or {}
@@ -209,7 +275,13 @@ def render_markdown(
         tags=tags,
         fm_source=fm_source,
     )
-    body = render_body(segments, speaker_map=speaker_map, merge_gap_seconds=merge_gap_seconds)
+    body = render_body(
+        segments,
+        speaker_map=speaker_map,
+        merge_gap_seconds=merge_gap_seconds,
+        mark_suspect=mark_suspect,
+        paragraph_chars=paragraph_chars,
+    )
     return f"{fm}\n{body}" if body else fm
 
 

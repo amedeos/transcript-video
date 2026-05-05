@@ -73,6 +73,17 @@ class TestFormatSpeakerOverview:
         # Unmapped labels still appear under both Label and Name columns.
         assert "SPEAKER_01" in out
 
+    def test_includes_suspect_column(self):
+        # Set num_suspect on the cached stats and verify it shows up.
+        transcript = _two_speaker_transcript()
+        transcript["stats"]["speakers"]["SPEAKER_00"]["num_suspect"] = 3
+        transcript["stats"]["speakers"]["SPEAKER_01"]["num_suspect"] = 0
+        out = _format_speaker_overview(transcript, {})
+        assert "Suspect" in out
+        # The "3" suspect count for SPEAKER_00 must appear on its row.
+        speaker_00_line = next(line for line in out.splitlines() if line.startswith("SPEAKER_00"))
+        assert " 3 " in speaker_00_line or speaker_00_line.endswith(" 3  Allora...")
+
     def test_no_speakers_message(self):
         out = _format_speaker_overview({"stats": {}, "segments": []}, {})
         assert "No speakers detected" in out

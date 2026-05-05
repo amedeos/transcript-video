@@ -10,6 +10,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from . import project_config
 from .markdown import load_transcript_json, render_markdown, write_markdown
 from .speakers import display_name, resolve_speaker_map
 from .stats import compute_speaker_stats
@@ -71,6 +72,16 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--paragraph-chars",
+        type=int,
+        default=400,
+        help=(
+            "Break long speaker blocks into paragraphs at sentence boundaries when "
+            "the running paragraph exceeds this many characters (default: 400). "
+            "Set to 0 to disable splitting (single paragraph per merged block)."
+        ),
+    )
+    parser.add_argument(
         "--list-speakers",
         action="store_true",
         help=(
@@ -79,11 +90,56 @@ def _build_parser() -> argparse.ArgumentParser:
             "filling in --speaker-map."
         ),
     )
+    parser.add_argument(
+        "--mark-suspect",
+        action="store_true",
+        help=(
+            "Prefix each segment flagged as suspect (low ASR confidence or "
+            "high silence probability) with `[?]` inline in the Markdown body. "
+            "Default off — keeps the rendered transcript clean."
+        ),
+    )
 
     verbosity = parser.add_mutually_exclusive_group()
     verbosity.add_argument("-q", "--quiet", action="store_true", help="Suppress info-level output.")
     verbosity.add_argument("-v", "--verbose", action="store_true", help="Enable debug-level output.")
+
+    parser.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "Path to a transcript-video.toml file. If omitted, the tool looks for one "
+            "in the current directory and then alongside the JSON."
+        ),
+    )
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help="Apply [profiles.NAME] from the config on top of the top-level defaults.",
+    )
     return parser
+
+
+def _build_pre_parser() -> argparse.ArgumentParser:
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=None)
+    pre.add_argument("--profile", default=None)
+    pre.add_argument("json_path", nargs="?", default=None)
+    return pre
+
+
+def _apply_config_defaults(parser: argparse.ArgumentParser, cli_defaults: dict) -> tuple[set[str], set[str]]:
+    known = {a.dest for a in parser._actions if a.dest != "help"}
+    applied: dict = {}
+    ignored: set[str] = set()
+    for key, value in cli_defaults.items():
+        if key in known:
+            applied[key] = value
+        else:
+            ignored.add(key)
+    if applied:
+        parser.set_defaults(**applied)
+    return set(applied.keys()), ignored
 
 
 def _resolve_speaker_stats(transcript: dict) -> dict:
@@ -113,6 +169,7 @@ def _format_speaker_overview(transcript: dict, speaker_map: dict[str, str]) -> s
                 format_timestamp_hms(float(bucket.get("duration_seconds") or 0.0)),
                 f"{float(bucket.get('percentage') or 0.0):5.1f}%",
                 str(bucket.get("num_turns") or 0),
+                str(bucket.get("num_suspect") or 0),
                 str(bucket.get("first_text") or ""),
             )
         )
@@ -121,18 +178,31 @@ def _format_speaker_overview(transcript: dict, speaker_map: dict[str, str]) -> s
     name_w = max(len("Name"), max(len(r[1]) for r in rows))
 
     header = (
-        f"{'Label':<{label_w}}  {'Name':<{name_w}}  {'Duration':>8}  {'%':>6}  {'Turns':>5}  First words"
+        f"{'Label':<{label_w}}  {'Name':<{name_w}}  "
+        f"{'Duration':>8}  {'%':>6}  {'Turns':>5}  {'Suspect':>7}  First words"
     )
     sep = "-" * len(header)
     body = [
-        f"{label:<{label_w}}  {name:<{name_w}}  {dur:>8}  {pct:>6}  {turns:>5}  {first}"
-        for (label, name, dur, pct, turns, first) in rows
+        f"{label:<{label_w}}  {name:<{name_w}}  "
+        f"{dur:>8}  {pct:>6}  {turns:>5}  {susp:>7}  {first}"
+        for (label, name, dur, pct, turns, susp, first) in rows
     ]
     return "\n".join([header, sep, *body])
 
 
 def main(argv: list[str] | None = None) -> None:
+    pre_args, _ = _build_pre_parser().parse_known_args(argv)
+    json_input = Path(pre_args.json_path) if pre_args.json_path else None
+    cli_defaults, speaker_map_from_config, _ = project_config.resolve(
+        explicit=pre_args.config,
+        profile=pre_args.profile,
+        input_file=json_input,
+    )
+
     parser = _build_parser()
+    if cli_defaults:
+        _apply_config_defaults(parser, cli_defaults)
+
     args = parser.parse_args(argv)
 
     setup_logging(quiet=args.quiet, verbose=args.verbose)
@@ -144,7 +214,9 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
 
     transcript = load_transcript_json(json_path)
-    speaker_map = resolve_speaker_map(args.speaker_map, args.speaker_map_file)
+    speaker_map = resolve_speaker_map(
+        args.speaker_map, args.speaker_map_file, fallback=speaker_map_from_config
+    )
 
     if args.list_speakers:
         print(_format_speaker_overview(transcript, speaker_map))
@@ -157,6 +229,8 @@ def main(argv: list[str] | None = None) -> None:
         tags=list(args.tags or []),
         fm_source=args.fm_source,
         merge_gap_seconds=args.merge_gap_seconds,
+        mark_suspect=args.mark_suspect,
+        paragraph_chars=args.paragraph_chars,
     )
 
     output_path = Path(args.output) if args.output else json_path.with_suffix(".md")
