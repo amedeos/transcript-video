@@ -5,12 +5,13 @@
 #
 # Base choice: nvcr.io/nvidia/cuda over docker.io to use NVIDIA's own
 # registry (more authoritative than the Docker Hub mirror), and ubi9
-# over ubuntu so the stack is Red Hat-aligned. CUDA tag is 12.8.2 to
-# match PyTorch's `torch==X.Y.Z+cu128` wheel — the version pip installs
-# from PyPI today. Going to CUDA 13 base would mismatch with the
-# wheel's bundled libs; revisit once PyTorch publishes `+cu13x`.
+# over ubuntu so the stack is Red Hat-aligned. CUDA tag is 12.8.1
+# (the latest patch of the 12.8.x line) to match PyTorch's
+# `torch==X.Y.Z+cu128` wheel — the version pip installs from PyPI
+# today. Going to CUDA 13 base would mismatch with the wheel's
+# bundled libs; revisit once PyTorch publishes `+cu13x`.
 # UBI10 is not yet an option: NVIDIA only publishes ubi10 tags for
-# CUDA 13.2.1, not for the 12.x line.
+# CUDA 13.2.x, not for the 12.x line.
 #
 # Build (with podman):
 #     podman build -t transcript-video -f Containerfile .
@@ -38,18 +39,20 @@
 # The HuggingFace cache is shared with the host so the diarization model
 # is downloaded only once across runs.
 
-FROM nvcr.io/nvidia/cuda:12.8.2-cudnn-runtime-ubi9
+FROM nvcr.io/nvidia/cuda:12.8.1-cudnn-runtime-ubi9
 
-# Tooling: Python 3.12 (UBI9 ships it as a direct package since 9.4),
-# curl + xz (for fetching the static ffmpeg build), tar (for extraction).
+# Tooling: Python 3.12 (UBI9 ships it as a direct package since 9.4)
+# plus xz (needed to extract the static ffmpeg .tar.xz). The CUDA UBI9
+# base already ships curl-minimal (provides /usr/bin/curl) and tar, so
+# we don't request them here — doing so would trigger a curl /
+# curl-minimal conflict.
+#
 # UBI9 does NOT include ffmpeg by default — it's omitted from RHEL/UBI
 # for licensing reasons. We pull a static GPL build from John Van
 # Sickle's canonical mirror; single binary, no system deps.
 RUN dnf install -y --setopt=install_weak_deps=False \
         python3.12 \
         python3.12-devel \
-        curl \
-        tar \
         xz && \
     dnf clean all && \
     rm -rf /var/cache/dnf

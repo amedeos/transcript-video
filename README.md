@@ -369,7 +369,7 @@ CLI flags always override the config. The config provides defaults; it never res
 
 ## Container (Podman / Docker)
 
-A [`Containerfile`](Containerfile) ships with the repo. It builds an image with whisperX + pyannote ready to run, on top of `nvcr.io/nvidia/cuda:12.8.2-cudnn-runtime-ubi9` — Red Hat-aligned (UBI9 + NVIDIA's own registry), CUDA tag pinned to match the `+cu128` PyTorch wheel pip installs from PyPI. ffmpeg is fetched as a static GPL build (UBI/RHEL omits ffmpeg for licensing reasons).
+A [`Containerfile`](Containerfile) ships with the repo. It builds an image with whisperX + pyannote ready to run, on top of `nvcr.io/nvidia/cuda:12.8.1-cudnn-runtime-ubi9` — Red Hat-aligned (UBI9 + NVIDIA's own registry), CUDA tag pinned to match the `+cu128` PyTorch wheel pip installs from PyPI. ffmpeg is fetched as a static GPL build (UBI/RHEL omits ffmpeg for licensing reasons).
 
 Build:
 
