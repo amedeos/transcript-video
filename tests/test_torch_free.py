@@ -32,6 +32,7 @@ BLOCKED_PREFIXES = (
 PROTECTED_MODULES = (
     "transcript_video.utils",
     "transcript_video.speakers",
+    "transcript_video.stats",
     "transcript_video.markdown",
     "transcript_video.writers",
     "transcript_video.cli_to_md",
