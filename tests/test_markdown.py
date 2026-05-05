@@ -19,6 +19,7 @@ from transcript_video.markdown import (
     render_body,
     render_frontmatter,
     render_markdown,
+    split_into_paragraphs,
     write_markdown,
 )
 
@@ -267,6 +268,30 @@ class TestRenderBody:
     def test_empty_segments_returns_empty_string(self):
         assert render_body([], speaker_map={}) == ""
 
+    def test_mark_suspect_off_keeps_body_clean(self):
+        segs = [
+            {"speaker": "A", "start": 0.0, "end": 5.0, "text": "Maybe wrong", "suspect": True},
+            {"speaker": "A", "start": 5.0, "end": 10.0, "text": "Definitely right"},
+        ]
+        body = render_body(segs, speaker_map={}, merge_gap_seconds=1.5)
+        assert "[?]" not in body
+
+    def test_mark_suspect_inline_marker(self):
+        segs = [
+            {"speaker": "A", "start": 0.0, "end": 5.0, "text": "Definitely right"},
+            {"speaker": "A", "start": 5.0, "end": 10.0, "text": "Maybe wrong", "suspect": True},
+            {"speaker": "A", "start": 10.0, "end": 15.0, "text": "Right again"},
+        ]
+        body = render_body(segs, speaker_map={}, merge_gap_seconds=1.5, mark_suspect=True)
+        # Single merged block, with the marker preserving position of the suspect span.
+        assert body.count("## [") == 1
+        assert "Definitely right [?] Maybe wrong Right again" in body
+
+    def test_mark_suspect_no_op_when_no_suspect_segments(self):
+        segs = [{"speaker": "A", "start": 0.0, "end": 5.0, "text": "Hello"}]
+        body = render_body(segs, speaker_map={}, merge_gap_seconds=1.5, mark_suspect=True)
+        assert "[?]" not in body
+
 
 class TestRenderMarkdown:
     def test_full_document(self):
@@ -310,3 +335,60 @@ class TestModuleLevelFlags:
     def test_unknown_speaker_constant(self):
         # Sanity check that the constant is exposed for tests.
         assert md_mod.UNKNOWN_SPEAKER == "Unknown"
+
+
+class TestSplitIntoParagraphs:
+    def test_no_split_below_threshold(self):
+        text = "Short sentence. Another short one."
+        assert split_into_paragraphs(text, max_chars=400) == [text]
+
+    def test_split_when_long(self):
+        # Each sentence is ~50 chars; threshold 100 → ~2 sentences per paragraph.
+        sentences = ". ".join([f"Sentence number {i} with enough words to be real" for i in range(6)]) + "."
+        paragraphs = split_into_paragraphs(sentences, max_chars=100)
+        assert len(paragraphs) >= 3
+        # Every paragraph must end with sentence-final punctuation.
+        for p in paragraphs:
+            assert p.rstrip().endswith((".", "!", "?"))
+
+    def test_single_long_sentence_kept_whole(self):
+        # No way to split; return as a single paragraph even if it overflows.
+        text = "This single sentence is longer than the threshold but cannot be split."
+        out = split_into_paragraphs(text, max_chars=20)
+        assert out == [text]
+
+    def test_zero_max_disables_splitting(self):
+        text = ("Sentence one. " * 100).strip()
+        assert split_into_paragraphs(text, max_chars=0) == [text]
+
+    def test_negative_max_disables_splitting(self):
+        text = "Sentence one. Sentence two."
+        assert split_into_paragraphs(text, max_chars=-1) == [text]
+
+    def test_empty_text(self):
+        assert split_into_paragraphs("", max_chars=400) == []
+        assert split_into_paragraphs("   ", max_chars=400) == []
+
+
+class TestRenderBodyParagraphSplitting:
+    def test_long_block_split_by_default(self):
+        # A single 1000-char block from one speaker.
+        long_text = ". ".join(
+            [f"Frase numero {i}, contenente abbastanza parole per essere realistica e leggibile" for i in range(15)]
+        ) + "."
+        segs = [{"speaker": "A", "start": 0.0, "end": 100.0, "text": long_text}]
+        body = render_body(segs, speaker_map={}, merge_gap_seconds=1.5, paragraph_chars=400)
+        # Single heading, multiple paragraphs (separated by blank lines).
+        assert body.count("## [") == 1
+        assert "\n\n" in body  # paragraph separator
+
+    def test_paragraph_chars_zero_no_split(self):
+        long_text = ". ".join([f"Frase {i}" for i in range(50)]) + "."
+        segs = [{"speaker": "A", "start": 0.0, "end": 10.0, "text": long_text}]
+        body = render_body(segs, speaker_map={}, merge_gap_seconds=1.5, paragraph_chars=0)
+        # No paragraph splits inside the block: only the trailing blank line
+        # separating block from EOF, no double newline within the block body.
+        # Strip the trailing "\n" then the final "\n" from rstrip and check.
+        block_lines = body.rstrip().split("\n")
+        # Lines: heading + single paragraph = 2 lines.
+        assert len(block_lines) == 2

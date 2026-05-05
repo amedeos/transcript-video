@@ -2,6 +2,16 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Working agreement: never auto-commit
+
+The user reviews and validates every commit individually before it lands. **Do not run `git commit` on your own**, even when:
+
+- a previous instruction said "go ahead and commit" — that approval is one-shot, not a standing license
+- multiple logical units are obviously ready to be split across commits
+- auto mode is active (auto mode covers code changes, not publishing actions)
+
+After completing a change, stage the files explicitly and stop. Show the user a summary of what would be committed and wait for an explicit per-commit "ok" before running `git commit`. If you have several batches of changes, get approval for each batch separately rather than chaining them.
+
 ## What this project is
 
 `transcript-video` is the **English-language successor** of [transcript-italian-video](https://github.com/amedeos/transcript-italian-video). It transcribes and diarizes video/audio using whisperX (faster-whisper + wav2vec2 alignment + pyannote 3.x diarization) and produces JSON / SRT / TXT / Markdown.
@@ -44,8 +54,8 @@ These are non-obvious from the code and **must hold across any refactor**.
 
 `transcript-to-md` exists so users can re-render Markdown from a saved JSON without a GPU or model download. The protected set (enforced by `tests/test_torch_free.py`):
 
-- `utils.py`, `speakers.py`, `stats.py`, `markdown.py`, `writers.py`, `cli_to_md.py`
-- Allowed deps: stdlib + PyYAML
+- `utils.py`, `speakers.py`, `stats.py`, `markdown.py`, `writers.py`, `project_config.py`, `cli_to_md.py`
+- Allowed deps: stdlib + PyYAML + `tomli`/`tomllib`
 
 Do **not** add imports from `asr`, `diarize`, `pipeline`, `preflight`, `whisperx`, `torch`, `pyannote`, `transformers`, `ctranslate2`, or `faster_whisper` to those modules. If you need a helper from there, lift it into `utils.py` / `stats.py` instead.
 
@@ -80,6 +90,18 @@ Both share the same schema. The top-level `stage` field discriminates them (`"al
 ### 6. Pre-flight runs by default
 
 `preflight.run_preflight(config)` is invoked at the start of every transcription unless `--no-check` is passed. The pre-flight tests we hit on real machines (HF token validity, gated-model access, whisperX API resolution) catch failures in 1–2 seconds instead of 5 minutes. When adding a new external dependency to the pipeline, add a pre-flight check for it.
+
+### 7. CLI flags always win over the config file
+
+`project_config.toml` provides defaults via `parser.set_defaults(**)`; explicit CLI flags overwrite them at parse time. Don't introduce config keys that "force" a value (e.g. by reading the config AFTER `parser.parse_args`); the contract is one-directional. The order of resolution for the config itself is: `--config` explicit → `./transcript-video.toml` → `<input_dir>/transcript-video.toml` → none.
+
+`[speaker_map]` is special-cased: it's not a CLI flag (the CLI uses `--speaker-map` / `--speaker-map-file`), so we extract it separately and pass it as `fallback` to `resolve_speaker_map`. When refactoring this, keep the precedence: `--speaker-map` > `--speaker-map-file` > config `[speaker_map]` > `{}`.
+
+### 8. Suspect thresholds are policy, not data
+
+`stats.DEFAULT_AVG_LOGPROB_THRESHOLD = -1.0` and `DEFAULT_NO_SPEECH_PROB_THRESHOLD = 0.6` are tuning constants for whisperX large-v3. They are persisted in `parameters.suspect_thresholds` so a downstream consumer can tell *which* thresholds produced the flags. Don't change the defaults silently — bump `schema_version` if the new defaults would meaningfully reshuffle the suspect set on existing JSONs.
+
+`mark_suspect_segments` mutates segments in place. Calling it on segments that were already flagged is idempotent (the existing `suspect: true` is overwritten with the same value); but if you change thresholds between calls, the previous flags are NOT cleared first. If that ever matters, normalize at the start of the function.
 
 ## Reference-project parity
 

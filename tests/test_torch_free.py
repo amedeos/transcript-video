@@ -35,6 +35,7 @@ PROTECTED_MODULES = (
     "transcript_video.stats",
     "transcript_video.markdown",
     "transcript_video.writers",
+    "transcript_video.project_config",
     "transcript_video.cli_to_md",
 )
 

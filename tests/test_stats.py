@@ -1,10 +1,15 @@
-"""Tests for per-speaker statistics."""
+"""Tests for per-speaker statistics and suspect-segment flagging."""
 
 from __future__ import annotations
 
 import pytest
 
-from transcript_video.stats import compute_speaker_stats, count_unique_speakers
+from transcript_video.stats import (
+    compute_speaker_stats,
+    count_suspect_segments,
+    count_unique_speakers,
+    mark_suspect_segments,
+)
 
 
 class TestCountUniqueSpeakers:
@@ -89,3 +94,72 @@ class TestComputeSpeakerStats:
         stats = compute_speaker_stats(segs)
         assert stats["A"]["duration_seconds"] == 0.0
         assert stats["A"]["percentage"] == 0.0
+
+    def test_num_suspect_aggregated_per_speaker(self):
+        segs = [
+            {"speaker": "A", "start": 0.0, "end": 5.0, "text": "x", "suspect": True},
+            {"speaker": "A", "start": 5.0, "end": 10.0, "text": "y"},
+            {"speaker": "B", "start": 10.0, "end": 15.0, "text": "z", "suspect": True},
+            {"speaker": "B", "start": 15.0, "end": 20.0, "text": "w", "suspect": True},
+        ]
+        stats = compute_speaker_stats(segs)
+        assert stats["A"]["num_suspect"] == 1
+        assert stats["B"]["num_suspect"] == 2
+
+
+class TestMarkSuspectSegments:
+    def test_low_logprob_flagged(self):
+        segs = [
+            {"text": "x", "avg_logprob": -1.4},
+            {"text": "y", "avg_logprob": -0.3},
+        ]
+        flagged = mark_suspect_segments(segs)
+        assert flagged == 1
+        assert segs[0]["suspect"] is True
+        assert segs[0]["suspect_reasons"] == ["low_logprob"]
+        assert "suspect" not in segs[1]
+
+    def test_high_no_speech_prob_flagged(self):
+        segs = [
+            {"text": "x", "no_speech_prob": 0.85},
+            {"text": "y", "no_speech_prob": 0.05},
+        ]
+        flagged = mark_suspect_segments(segs)
+        assert flagged == 1
+        assert segs[0]["suspect_reasons"] == ["high_no_speech_prob"]
+
+    def test_multiple_reasons(self):
+        segs = [{"text": "x", "avg_logprob": -1.5, "no_speech_prob": 0.8}]
+        mark_suspect_segments(segs)
+        assert set(segs[0]["suspect_reasons"]) == {"low_logprob", "high_no_speech_prob"}
+
+    def test_missing_metrics_leaves_segment_alone(self):
+        segs = [{"text": "x"}]  # no metrics — never flagged
+        flagged = mark_suspect_segments(segs)
+        assert flagged == 0
+        assert "suspect" not in segs[0]
+
+    def test_at_threshold_not_flagged(self):
+        # avg_logprob == threshold should NOT be flagged (strict comparison).
+        segs = [{"text": "x", "avg_logprob": -1.0, "no_speech_prob": 0.6}]
+        flagged = mark_suspect_segments(segs)
+        assert flagged == 0
+
+    def test_custom_thresholds(self):
+        segs = [{"text": "x", "avg_logprob": -0.4}]
+        flagged = mark_suspect_segments(segs, avg_logprob_threshold=-0.3)
+        assert flagged == 1
+
+
+class TestCountSuspectSegments:
+    def test_counts_only_flagged(self):
+        segs = [
+            {"suspect": True},
+            {"suspect": False},
+            {},
+            {"suspect": True},
+        ]
+        assert count_suspect_segments(segs) == 2
+
+    def test_empty(self):
+        assert count_suspect_segments([]) == 0
