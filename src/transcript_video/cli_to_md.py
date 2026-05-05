@@ -13,7 +13,7 @@ from pathlib import Path
 from .markdown import load_transcript_json, render_markdown, write_markdown
 from .speakers import display_name, resolve_speaker_map
 from .stats import compute_speaker_stats
-from .utils import format_timestamp_hms, setup_logging
+from .utils import format_timestamp_hms, setup_logging, silence_known_noisy_warnings
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -136,6 +136,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     setup_logging(quiet=args.quiet, verbose=args.verbose)
+    silence_known_noisy_warnings()
 
     json_path = Path(args.json_path)
     if not json_path.exists():

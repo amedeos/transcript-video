@@ -10,7 +10,7 @@ from .config import DiarizationConfig, FrontmatterConfig, OutputConfig, RunConfi
 from .pipeline import run_pipeline
 from .preflight import report_results, run_preflight
 from .speakers import resolve_speaker_map
-from .utils import read_text_file, setup_logging
+from .utils import read_text_file, setup_logging, silence_known_noisy_warnings
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -233,6 +233,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     setup_logging(quiet=args.quiet, verbose=args.verbose)
+    silence_known_noisy_warnings()
 
     # Resolve the input file: from CLI, or from the aligned snapshot when resuming.
     input_file: Path | None = Path(args.input_file) if args.input_file else None

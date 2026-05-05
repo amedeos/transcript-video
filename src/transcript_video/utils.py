@@ -1,9 +1,10 @@
-"""Shared utilities: timestamp formatting, file helpers, and logging setup."""
+"""Shared utilities: timestamp formatting, file helpers, logging, warning filters."""
 
 from __future__ import annotations
 
 import logging
 import sys
+import warnings
 from pathlib import Path
 
 
@@ -38,6 +39,34 @@ def format_timestamp_short(seconds: float) -> str:
     minutes = int(seconds // 60)
     secs = int(seconds % 60)
     return f"[{minutes:02d}:{secs:02d}]"
+
+
+def silence_known_noisy_warnings() -> None:
+    """Hide third-party warnings that are not actionable for this tool.
+
+    These all originate from the pyannote / torchcodec / lightning stack and
+    do not indicate problems with our pipeline:
+
+    - **torchcodec / ffmpeg version mismatch**: torchcodec supports ffmpeg 4-7
+      and warns loudly on ffmpeg ≥ 8. We don't use torchcodec — whisperX loads
+      audio through ffmpeg directly via subprocess, which is exactly the
+      fallback path the warning describes. Hiding it removes a 20-line
+      paragraph that confuses users every run.
+    - **TF32 disabled**: pyannote turns off TensorFloat-32 for reproducibility.
+      Informational; no quality impact for transcription/diarization.
+
+    Lightning's checkpoint-upgrade *print* (not a warning) is left visible
+    because it can't be suppressed without redirecting stderr globally and
+    isn't actually noisy enough to justify that.
+    """
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*torchcodec is not installed correctly.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*TensorFloat-32.*has been disabled.*",
+    )
 
 
 def setup_logging(*, quiet: bool = False, verbose: bool = False) -> None:
