@@ -59,13 +59,17 @@ def silence_known_noisy_warnings() -> None:
     because it can't be suppressed without redirecting stderr globally and
     isn't actually noisy enough to justify that.
     """
+    # Both pyannote warnings are multi-line and start with a leading newline
+    # (they're built from triple-quoted f-strings), so the regex needs the
+    # DOTALL flag (?s) to let `.` match newlines. Without it, the filter
+    # silently never fires — this exact bug shipped on the first attempt.
     warnings.filterwarnings(
         "ignore",
-        message=r".*torchcodec is not installed correctly.*",
+        message=r"(?s).*torchcodec is not installed correctly.*",
     )
     warnings.filterwarnings(
         "ignore",
-        message=r".*TensorFloat-32.*has been disabled.*",
+        message=r"(?s).*TensorFloat-32.*has been disabled.*",
     )
 
 

@@ -71,22 +71,32 @@ class TestFormatTimestampShort:
 
 
 class TestSilenceKnownNoisyWarnings:
+    # Real warning text from pyannote.audio: triple-quoted f-string that begins
+    # with a newline. The filter must handle this multiline shape, otherwise
+    # `.` in the default-flag regex doesn't span the leading "\n" and the
+    # filter silently does nothing.
+    REAL_TORCHCODEC_MESSAGE = (
+        "\ntorchcodec is not installed correctly so built-in audio decoding "
+        "will fail. Solutions are:\n* use audio preloaded in-memory ..."
+    )
+    REAL_TF32_MESSAGE = (
+        "TensorFloat-32 (TF32) has been disabled as it might lead to "
+        "reproducibility issues and lower accuracy.\nIt can be re-enabled "
+        "by calling\n   >>> import torch"
+    )
+
     def test_torchcodec_warning_silenced(self):
         with warnings.catch_warnings(record=True) as captured:
             warnings.resetwarnings()
             silence_known_noisy_warnings()
-            warnings.warn(
-                "torchcodec is not installed correctly so built-in audio decoding will fail.",
-                UserWarning,
-                stacklevel=2,
-            )
+            warnings.warn(self.REAL_TORCHCODEC_MESSAGE, UserWarning, stacklevel=2)
             assert not captured
 
     def test_tf32_warning_silenced(self):
         with warnings.catch_warnings(record=True) as captured:
             warnings.resetwarnings()
             silence_known_noisy_warnings()
-            warnings.warn("TensorFloat-32 (TF32) has been disabled", UserWarning, stacklevel=2)
+            warnings.warn(self.REAL_TF32_MESSAGE, UserWarning, stacklevel=2)
             assert not captured
 
     def test_unrelated_warnings_pass_through(self):
