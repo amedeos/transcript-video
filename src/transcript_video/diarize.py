@@ -138,17 +138,23 @@ def _gated_repo_message(model_name: str | None, error: Exception) -> str:
     lines = [
         "Error: HuggingFace denied access to the diarization model (HTTP 403 / GatedRepo).",
         "",
-        "Most likely you have not yet accepted the model's terms of use. Steps:",
+        "Two distinct gating modes exist:",
+        "  - 'community-1' uses MANUAL approval — accepting the terms only files a request;",
+        "    the pyannote team must approve it (can take hours or days).",
+        "  - 'speaker-diarization-3.1' uses AUTO approval — clicking 'Agree' grants access",
+        "    immediately. Recommended if you need to start now.",
+        "",
+        "Steps:",
     ]
     if repo_hint:
         lines.append(f"  1. Visit https://huggingface.co/{repo_hint} and click 'Agree and access repository'.")
     else:
         lines.append("  1. Visit the model page on huggingface.co and accept its terms.")
     lines.append("  2. Confirm your token has 'read' scope at https://hf.co/settings/tokens .")
-    lines.append("  3. Re-run the command. The model is downloaded once and cached locally.")
+    lines.append("  3. For 'speaker-diarization-3.1' also accept https://huggingface.co/pyannote/segmentation-3.0 .")
+    lines.append("  4. Re-run; the model is downloaded once and cached locally.")
     lines.append("")
-    lines.append("Tip: pass --diarize-model pyannote/speaker-diarization-3.1 to use the older")
-    lines.append("model if you prefer (it has its own gating page).")
+    lines.append("Switch model with: --diarize-model pyannote/speaker-diarization-3.1")
     return "\n".join(lines)
 
 
