@@ -12,6 +12,26 @@ The user reviews and validates every commit individually before it lands. **Do n
 
 After completing a change, stage the files explicitly and stop. Show the user a summary of what would be committed and wait for an explicit per-commit "ok" before running `git commit`. If you have several batches of changes, get approval for each batch separately rather than chaining them.
 
+## Working agreement: branch before modifying
+
+Never edit files directly on `main`. Before starting any modification, create a dedicated branch from an up-to-date `main`:
+
+```bash
+git checkout main && git pull --ff-only
+git checkout -b <prefix>/<short-slug>
+```
+
+Branch name prefixes (pick the one that matches the intent):
+
+- `feature/` — new functionality
+- `fix/` — bug fix
+- `refactor/` — restructuring without behavior change
+- `docs/` — documentation-only changes (README, CLAUDE.md, comments-only edits)
+
+The slug after the prefix is short, kebab-case, and describes the change (e.g. `feature/srt-output`, `fix/diarize-token-kwarg`, `refactor/json-builder`, `docs/branch-policy`).
+
+This rule applies to every modification, including small docs touch-ups. Stacked branches (one branch off another, when the first is not yet merged) are allowed when the user explicitly opts in.
+
 ## What this project is
 
 `transcript-video` is the **English-language successor** of [transcript-italian-video](https://github.com/amedeos/transcript-italian-video). It transcribes and diarizes video/audio using whisperX (faster-whisper + wav2vec2 alignment + pyannote 3.x diarization) and produces JSON / SRT / TXT / Markdown.
@@ -42,7 +62,7 @@ python -m py_compile src/transcript_video/*.py
 Run the entry points (after install):
 
 ```bash
-transcribe-video INPUT [options]
+transcript-from-video INPUT [options]
 transcript-to-md PATH/TO/foo_transcript.json [options]
 ```
 
@@ -116,7 +136,7 @@ If you find yourself "improving" any of these, double-check the upstream behavio
 
 ## CLI design rules
 
-- Two binaries, not one with subcommands: `transcribe-video` (full pipeline) and `transcript-to-md` (pure re-render). They are wired in `pyproject.toml` under `[project.scripts]`.
+- Two binaries, not one with subcommands: `transcript-from-video` (full pipeline) and `transcript-to-md` (pure re-render). They are wired in `pyproject.toml` under `[project.scripts]`.
 - Mutex groups for `--prompt*` and `--hotwords*` because the three modes (inline / file / explicit-disable) are exclusive by design.
 - Frontmatter overrides (`--date`, `--tag`, `--source`) live on **both** binaries so re-rendering can correct or extend metadata after the fact.
 - `--merge-gap-seconds 0` means "never merge consecutive same-speaker segments". The check in `markdown._group_segments` is `merge_gap_seconds > 0` *then* `gap <= merge_gap_seconds` — keep that ordering.
