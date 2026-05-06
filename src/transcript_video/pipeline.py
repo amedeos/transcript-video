@@ -33,6 +33,13 @@ logger = logging.getLogger("transcript_video.pipeline")
 STAGE_ALIGNED = "aligned"
 STAGE_COMPLETE = "complete"
 
+KNOWN_MEDIA_EXTENSIONS = frozenset({
+    ".mp4", ".mkv", ".mov", ".webm", ".avi", ".flv", ".wmv",
+    ".mpeg", ".mpg", ".m4v", ".ts", ".mts", ".m2ts", ".ogv", ".3gp",
+    ".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".oga", ".opus",
+    ".wma", ".aiff", ".aif",
+})
+
 
 def _resolve_output_paths(config: RunConfig) -> dict[str, Path]:
     input_path = config.input_file.resolve()
@@ -320,8 +327,11 @@ def run_pipeline(config: RunConfig) -> dict[str, Path]:
     if not input_path.exists():
         print(f"Error: file not found: {input_path}", file=sys.stderr)
         sys.exit(1)
-    if input_path.suffix.lower() != ".mp4":
-        logger.warning("Input does not have an .mp4 extension; proceeding anyway: %s", input_path.name)
+    if input_path.suffix.lower() not in KNOWN_MEDIA_EXTENSIONS:
+        logger.warning(
+            "Input has an unrecognized media extension; proceeding anyway (ffmpeg will decide): %s",
+            input_path.name,
+        )
 
     paths = _resolve_output_paths(config)
 
