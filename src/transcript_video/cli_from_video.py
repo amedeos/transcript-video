@@ -1,4 +1,4 @@
-"""``transcribe-video`` CLI: full ASR + alignment + diarization pipeline."""
+"""``transcript-from-video`` CLI: full ASR + alignment + diarization pipeline."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from .utils import read_text_file, setup_logging, silence_known_noisy_warnings
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="transcribe-video",
+        prog="transcript-from-video",
         description=(
             "Transcribe and diarize a video/audio file using whisperX "
             "(faster-whisper backend + pyannote speaker diarization). "

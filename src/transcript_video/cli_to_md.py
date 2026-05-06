@@ -1,7 +1,7 @@
 """``transcript-to-md`` CLI: re-render Markdown from a JSON artifact.
 
 This entry point intentionally avoids any heavy imports (no torch, whisperX, or
-pyannote): it works on the JSON file produced by ``transcribe-video``.
+pyannote): it works on the JSON file produced by ``transcript-from-video``.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="transcript-to-md",
         description=(
             "Re-render a human-readable Markdown transcript from the JSON artifact "
-            "produced by transcribe-video. Runs without GPU or ML models."
+            "produced by transcript-from-video. Runs without GPU or ML models."
         ),
     )
 

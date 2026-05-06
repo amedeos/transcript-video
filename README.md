@@ -50,15 +50,15 @@ pip install -e .
 
 ### Running the binaries
 
-`uv pip install` finds `.venv` automatically without activating it, but the installed console scripts (`transcribe-video`, `transcript-to-md`, plus `pytest` / `ruff` from the dev extra) still need their environment active to be on `$PATH`. Two options:
+`uv pip install` finds `.venv` automatically without activating it, but the installed console scripts (`transcript-from-video`, `transcript-to-md`, plus `pytest` / `ruff` from the dev extra) still need their environment active to be on `$PATH`. Two options:
 
 ```bash
 # Activate the venv (classic):
 source .venv/bin/activate
-transcribe-video video.mp4
+transcript-from-video video.mp4
 
 # Or use `uv run` for one-off invocations (no activation):
-uv run transcribe-video video.mp4
+uv run transcript-from-video video.mp4
 ```
 
 ## HuggingFace token (for diarization)
@@ -71,10 +71,10 @@ Diarization needs a token. Resolved in this order:
 
 ## Usage
 
-### `transcribe-video`
+### `transcript-from-video`
 
 ```bash
-transcribe-video INPUT [options]
+transcript-from-video INPUT [options]
 ```
 
 JSON is always produced. SRT, TXT, and Markdown are opt-in.
@@ -83,27 +83,27 @@ JSON is always produced. SRT, TXT, and Markdown are opt-in.
 
 ```bash
 # Minimal: autodetect language, JSON only, diarization on
-transcribe-video video.mp4
+transcript-from-video video.mp4
 
 # All artifacts
-transcribe-video video.mp4 --srt --txt --md
+transcript-from-video video.mp4 --srt --txt --md
 
 # Force English, higher-accuracy beam, anti-loop mitigations
-transcribe-video interview.mp4 --language en --beam_size 10 --anti-loop
+transcript-from-video interview.mp4 --language en --beam_size 10 --anti-loop
 
 # Initial prompt for style/glossary, hotwords for proper nouns
-transcribe-video podcast.mp4 \
+transcript-from-video podcast.mp4 \
   --prompt "Glossary: API, GPU, microservices, Kubernetes." \
   --hotwords "Anthropic Claude faster-whisper"
 
 # Diarization with bounded speaker count + named speakers + frontmatter
-transcribe-video video.mp4 --md \
+transcript-from-video video.mp4 --md \
   --min-speakers 2 --max-speakers 4 \
   --speaker-map "SPEAKER_00=Amedeo,SPEAKER_01=Tizio" \
   --tag openshift --tag ovn-kubernetes --tag troubleshooting
 
 # Skip diarization (faster, no HF token needed)
-transcribe-video lecture.mp4 --no-diarize --txt --srt
+transcript-from-video lecture.mp4 --no-diarize --txt --srt
 ```
 
 #### Argument groups
@@ -224,7 +224,7 @@ transcript-to-md PATH/TO/foo_transcript.json \
 | Flag | Description |
 |------|-------------|
 | `-o`, `--output PATH` | Output path (default: `<stem>.md` next to the JSON) |
-| `--speaker-map "..."` / `--speaker-map-file PATH` | Same as `transcribe-video` |
+| `--speaker-map "..."` / `--speaker-map-file PATH` | Same as `transcript-from-video` |
 | `--date`, `--tag`, `--source` | Frontmatter overrides |
 | `--merge-gap-seconds FLOAT` | Merge consecutive same-speaker segments whose silent gap is at most this many seconds (default `1.5`; `0` disables merging) |
 | `--paragraph-chars N` | Break long speaker blocks into paragraphs at sentence boundaries when the running paragraph exceeds N characters (default 400; `0` disables splitting) |
@@ -362,7 +362,7 @@ Resolution order:
 Activate a profile with `--profile NAME`:
 
 ```bash
-transcribe-video video.mp4 --profile meeting --md
+transcript-from-video video.mp4 --profile meeting --md
 ```
 
 CLI flags always override the config. The config provides defaults; it never restricts.
@@ -392,7 +392,7 @@ podman run --rm \
 
 The container's working directory is `/data`, so paths in the command line are relative to the host directory bind-mounted there. The HuggingFace cache is shared with the host so the diarization model is downloaded once across runs.
 
-For CPU-only execution, drop `--device nvidia.com/gpu=all` and pass `--device cpu` to `transcribe-video` inside the container (slow — only sensible for short clips or smoke tests).
+For CPU-only execution, drop `--device nvidia.com/gpu=all` and pass `--device cpu` to `transcript-from-video` inside the container (slow — only sensible for short clips or smoke tests).
 
 ### Rootless podman: keep host groups for GPU access
 
@@ -445,7 +445,7 @@ whisperX ships alignment models for a fixed list of languages. If yours is missi
 Switch to a smaller model:
 
 ```bash
-transcribe-video video.mp4 --model medium
+transcript-from-video video.mp4 --model medium
 ```
 
 ## License

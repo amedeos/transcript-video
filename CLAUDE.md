@@ -42,7 +42,7 @@ python -m py_compile src/transcript_video/*.py
 Run the entry points (after install):
 
 ```bash
-transcribe-video INPUT [options]
+transcript-from-video INPUT [options]
 transcript-to-md PATH/TO/foo_transcript.json [options]
 ```
 
@@ -116,7 +116,7 @@ If you find yourself "improving" any of these, double-check the upstream behavio
 
 ## CLI design rules
 
-- Two binaries, not one with subcommands: `transcribe-video` (full pipeline) and `transcript-to-md` (pure re-render). They are wired in `pyproject.toml` under `[project.scripts]`.
+- Two binaries, not one with subcommands: `transcript-from-video` (full pipeline) and `transcript-to-md` (pure re-render). They are wired in `pyproject.toml` under `[project.scripts]`.
 - Mutex groups for `--prompt*` and `--hotwords*` because the three modes (inline / file / explicit-disable) are exclusive by design.
 - Frontmatter overrides (`--date`, `--tag`, `--source`) live on **both** binaries so re-rendering can correct or extend metadata after the fact.
 - `--merge-gap-seconds 0` means "never merge consecutive same-speaker segments". The check in `markdown._group_segments` is `merge_gap_seconds > 0` *then* `gap <= merge_gap_seconds` — keep that ordering.

@@ -1,7 +1,7 @@
 # Containerfile (OCI / Podman convention).
 #
 # Builds an image with whisperX + pyannote pre-installed, ready to run
-# `transcribe-video` and `transcript-to-md` on host audio/video files.
+# `transcript-from-video` and `transcript-to-md` on host audio/video files.
 #
 # Base choice: nvcr.io/nvidia/cuda over docker.io to use NVIDIA's own
 # registry (more authoritative than the Docker Hub mirror), and ubi9
@@ -99,5 +99,5 @@ VOLUME ["/data", "/root/.cache/huggingface"]
 
 # The image's purpose is the transcription pipeline. `--help` is a safe
 # no-op when no arguments are provided.
-ENTRYPOINT ["transcribe-video"]
+ENTRYPOINT ["transcript-from-video"]
 CMD ["--help"]
