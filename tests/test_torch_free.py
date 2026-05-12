@@ -112,6 +112,77 @@ def test_render_markdown_runs_without_torch(block_heavy_imports, tmp_path: Path)
     assert out_path.read_text(encoding="utf-8") == md
 
 
+def test_render_v2_with_speaker_identities_runs_without_torch(block_heavy_imports, tmp_path: Path):
+    """Schema v2 transcripts carry ``speaker_identities`` and ``speaker_clusters``.
+
+    The Markdown rendering layer must read both without dragging in any heavy
+    ML import. This catches regressions where someone adds e.g. ``import numpy``
+    to markdown.py to "tidy up" the embedding handling.
+    """
+    from transcript_video.markdown import load_transcript_json, render_markdown
+
+    transcript = {
+        "schema_version": 2,
+        "stage": "complete",
+        "source_file": "/path/to/sample.mp4",
+        "transcribed_at": "2026-05-12T10:30:00",
+        "parameters": {"backend": "whisperx", "model": "large-v3", "beam_size": 5},
+        "audio_info": {"language_detected": "en", "duration_seconds": 90.0},
+        "stats": {"num_segments": 1, "num_speakers": 1, "processing_seconds": 1.0},
+        "speaker_clusters": {
+            "SPEAKER_00": {
+                "embedding": [0.1, 0.2, 0.3],
+                "duration_s": 4.0,
+                "n_segments": 1,
+                "embedding_model": "pyannote/fake",
+            },
+        },
+        "speaker_identities": {
+            "SPEAKER_00": {"name": "Mario", "score": 0.85, "source": "auto"},
+        },
+        "segments": [
+            {"id": 0, "start": 0.0, "end": 4.0, "text": "Hello there.", "speaker": "SPEAKER_00"},
+        ],
+    }
+    json_path = tmp_path / "v2.json"
+    json_path.write_text(json.dumps(transcript), encoding="utf-8")
+
+    loaded = load_transcript_json(json_path)
+    md = render_markdown(loaded, speaker_map={})
+    # Identity fallback should kick in when CLI speaker_map is empty.
+    assert "## [00:00:00] Mario" in md
+
+
+def test_refresh_auto_identities_runs_without_torch(block_heavy_imports, tmp_path: Path):
+    """``transcript-to-md --identify-speakers`` does cosine matching in numpy-free
+    Python and writes to a JSON DB. The whole re-render auto-id path must stay
+    torch-free."""
+    from transcript_video.cli_to_md import _refresh_auto_identities
+    from transcript_video.speaker_db import save_db
+
+    db_path = tmp_path / "voices.json"
+    save_db({
+        "schema_version": 1,
+        "embedding_model": "pyannote/fake",
+        "speakers": {
+            "Mario": [{"embedding": [1.0, 0.0, 0.0], "source": "s", "duration_s": 10.0}],
+        },
+    }, db_path)
+
+    transcript = {
+        "schema_version": 2,
+        "speaker_clusters": {
+            "SPEAKER_00": {
+                "embedding": [1.0, 0.0, 0.0],
+                "duration_s": 10.0, "n_segments": 1,
+                "embedding_model": "pyannote/fake",
+            },
+        },
+    }
+    _refresh_auto_identities(transcript, voice_db=str(db_path), threshold=0.5)
+    assert transcript["speaker_identities"]["SPEAKER_00"]["name"] == "Mario"
+
+
 def test_blocking_finder_actually_blocks(block_heavy_imports):
     """Sanity check: the finder really does raise on a blocked prefix."""
     with pytest.raises(ImportError, match="must remain torch-free"):

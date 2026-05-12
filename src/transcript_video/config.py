@@ -36,6 +36,15 @@ class FrontmatterConfig:
 
 
 @dataclass
+class IdentifyConfig:
+    """Auto-identification of diarized clusters against a voice-print DB."""
+
+    enabled: bool = False
+    voice_db: Path | None = None  # ``None`` = use XDG default
+    threshold: float = 0.65
+
+
+@dataclass
 class RunConfig:
     input_file: Path
     model: str = "large-v3"
@@ -51,6 +60,7 @@ class RunConfig:
     diarization: DiarizationConfig = field(default_factory=DiarizationConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     frontmatter: FrontmatterConfig = field(default_factory=FrontmatterConfig)
+    identify: IdentifyConfig = field(default_factory=IdentifyConfig)
     speaker_map: dict[str, str] = field(default_factory=dict)
 
     # Path to a previously-saved ``*_transcript.aligned.json`` to resume from.

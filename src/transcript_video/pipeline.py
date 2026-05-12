@@ -22,6 +22,7 @@ from typing import Any
 
 from . import asr as asr_mod
 from . import diarize as diarize_mod
+from . import speaker_db as speaker_db_mod
 from . import speaker_embed as speaker_embed_mod
 from . import stats as stats_mod
 from .config import RunConfig
@@ -100,6 +101,7 @@ def _build_payload(
     segments: list[dict[str, Any]],
     processing_seconds: float,
     speaker_clusters: dict[str, Any] | None = None,
+    speaker_identities: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the canonical JSON payload. Used for both aligned and complete stages.
 
@@ -107,9 +109,15 @@ def _build_payload(
     :mod:`speaker_embed` after diarization. Aligned-stage and no-diarize-stage
     payloads carry an empty dict here.
 
-    Schema version 2 added the ``speaker_clusters`` field. Consumers that only
-    look at ``segments`` / ``parameters`` / ``stats`` (notably :mod:`markdown`)
-    are forward- and backward-compatible without changes.
+    ``speaker_identities`` maps cluster labels to ``{name, score, source}``
+    entries when ``--identify-speakers`` is on; otherwise empty. ``source``
+    is ``"auto"`` for DB matches and ``"manual"`` for entries coming from
+    the user's ``--speaker-map``.
+
+    Schema version 2 added both ``speaker_clusters`` and ``speaker_identities``.
+    Consumers that only look at ``segments`` / ``parameters`` / ``stats``
+    (notably :mod:`markdown`) are forward- and backward-compatible without
+    changes.
     """
     duration_seconds = float(segments[-1].get("end") or 0.0) if segments else 0.0
     # Annotate segments with `suspect` / `suspect_reasons` before computing the
@@ -161,6 +169,7 @@ def _build_payload(
             "speakers": stats_mod.compute_speaker_stats(segments),
         },
         "speaker_clusters": speaker_clusters or {},
+        "speaker_identities": speaker_identities or {},
         "segments": segments,
         "full_text": "\n".join(seg["text"] for seg in segments if seg.get("text")),
     }
@@ -309,6 +318,8 @@ def _diarize_payload(payload: dict[str, Any], config: RunConfig) -> dict[str, An
                 "Cluster embeddings will not be cached for this run.", e,
             )
 
+    speaker_identities = _resolve_speaker_identities(speaker_clusters, config)
+
     return _build_payload(
         stage=STAGE_COMPLETE,
         source_file=input_path,
@@ -321,7 +332,77 @@ def _diarize_payload(payload: dict[str, Any], config: RunConfig) -> dict[str, An
         segments=diarized_segments,
         processing_seconds=float(payload.get("stats", {}).get("processing_seconds") or 0.0),
         speaker_clusters=speaker_clusters,
+        speaker_identities=speaker_identities,
     )
+
+
+def _resolve_speaker_identities(
+    speaker_clusters: dict[str, Any], config: RunConfig
+) -> dict[str, Any]:
+    """Build ``speaker_identities`` for the JSON payload.
+
+    Only runs when ``config.identify.enabled`` is True. Combines two sources:
+
+    - **Auto** (``source="auto"``): each cluster's best DB match above
+      ``config.identify.threshold``, via :func:`speaker_db.auto_resolve_speaker_map`.
+    - **Manual** (``source="manual"``): every entry in ``config.speaker_map``
+      whose label is present in ``speaker_clusters``. Manual entries override
+      auto ones for the same label.
+
+    Any DB-side failure (missing file, unreadable, model mismatch) is logged
+    and treated as "no auto matches"; manual entries are still recorded.
+    """
+    if not config.identify.enabled:
+        return {}
+
+    identities: dict[str, Any] = {}
+
+    if speaker_clusters:
+        try:
+            db_path = speaker_db_mod.resolve_db_path(config.identify.voice_db)
+            db = speaker_db_mod.load_db(db_path)
+
+            first = next(iter(speaker_clusters.values()))
+            model = first.get("embedding_model") if isinstance(first, dict) else None
+            if model and not speaker_db_mod.embedding_model_compatible(db, model):
+                logger.warning(
+                    "Voice DB at %s uses embedding_model %r; clusters use %r. "
+                    "Auto-identification skipped for this run.",
+                    db_path, db.get("embedding_model"), model,
+                )
+            else:
+                auto = speaker_db_mod.auto_resolve_speaker_map(
+                    speaker_clusters, db, threshold=config.identify.threshold,
+                )
+                for label, info in auto.items():
+                    identities[label] = {
+                        "name": info["name"],
+                        "score": info["score"],
+                        "source": "auto",
+                    }
+                if auto:
+                    logger.info(
+                        "Auto-identified %d/%d cluster(s) from %s.",
+                        len(auto), len(speaker_clusters), db_path,
+                    )
+                else:
+                    logger.info(
+                        "Auto-identification ran against %s but no cluster cleared the threshold (%.2f).",
+                        db_path, config.identify.threshold,
+                    )
+        except Exception as e:
+            logger.warning("Auto-identification failed: %s. Manual entries (if any) still recorded.", e)
+
+    # Manual entries override auto for the same label.
+    for label, name in (config.speaker_map or {}).items():
+        if label in speaker_clusters:
+            identities[label] = {
+                "name": name,
+                "score": None,
+                "source": "manual",
+            }
+
+    return identities
 
 
 def _write_outputs(payload: dict[str, Any], config: RunConfig, paths: dict[str, Path]) -> dict[str, Path]:

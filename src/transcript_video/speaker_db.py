@@ -228,6 +228,42 @@ def embedding_model_compatible(db: dict[str, Any], model_id: str) -> bool:
     return existing is None or existing == model_id
 
 
+def auto_resolve_speaker_map(
+    cluster_embeddings: dict[str, dict[str, Any]],
+    db: dict[str, Any],
+    *,
+    threshold: float = DEFAULT_THRESHOLD,
+    top_k: int = DEFAULT_TOP_K,
+) -> dict[str, dict[str, Any]]:
+    """For each cluster, find the best DB match above ``threshold``.
+
+    Returns ``{cluster_label: {"name", "score", "n_samples"}}`` including
+    only clusters that matched above threshold. Clusters with no good match
+    are omitted — the caller keeps their ``SPEAKER_XX`` label as-is.
+
+    Designed to be called from both the heavy path (``pipeline.py`` at
+    transcribe time) and the torch-free path (``cli_to_md.py`` at re-render
+    time): both consume the cached ``speaker_clusters`` field. Compatibility
+    of the embedding model between cluster and DB is the caller's
+    responsibility — use :func:`embedding_model_compatible` first.
+    """
+    result: dict[str, dict[str, Any]] = {}
+    for label, info in cluster_embeddings.items():
+        if not isinstance(info, dict):
+            continue
+        embedding = info.get("embedding")
+        if not isinstance(embedding, list) or not embedding:
+            continue
+        m = match(embedding, db, threshold=threshold, top_k=top_k)
+        if m is not None:
+            result[label] = {
+                "name": m.name,
+                "score": m.score,
+                "n_samples": m.n_samples,
+            }
+    return result
+
+
 def all_speaker_names(db: dict[str, Any]) -> list[str]:
     """Return all speaker names in the DB, sorted alphabetically."""
     return sorted((db.get("speakers") or {}).keys())
