@@ -20,6 +20,7 @@ This project is the English-language successor of [transcript-italian-video](htt
 - **Per-speaker stats** in the JSON (talk time, percentage, turns, suspect counts) and a `transcript-to-md --list-speakers` overview to help with mapping labels to names.
 - **Suspect-segment flagging**: low-confidence ASR segments are marked in the JSON with `suspect: true` and `suspect_reasons: [...]`. Optional `--mark-suspect` adds an inline `[?]` marker in the rendered Markdown, exactly where the dubious span starts.
 - **Paragraph splitting**: long speaker blocks are broken at sentence boundaries when they exceed `--paragraph-chars` (default 400) — keeps the rendered transcript scannable without fragmenting turns.
+- **Cross-video speaker auto-identification** (`--identify-speakers` + `transcript-learn` + `transcript-voices`): after enrolling speakers from a few transcripts, future videos containing the same voices are auto-labeled. Identification works both at pipeline time (`transcript-from-video --identify-speakers`) and at re-render time (`transcript-to-md --identify-speakers`, torch-free).
 - **Project config file** (`transcript-video.toml`): persist per-project flags (model, beam_size, hotwords, tags, speaker map, ...) and switch bundles via `--profile NAME`.
 
 ## Requirements
@@ -28,6 +29,7 @@ This project is the English-language successor of [transcript-italian-video](htt
 - ffmpeg available on `$PATH`
 - For GPU runs: NVIDIA driver + CUDA (≥10 GB VRAM recommended; 16 GB+ for `large-v3`)
 - For diarization: a HuggingFace account with the diarization model's terms accepted, plus an HF token. whisperX's current default is [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1); the older [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) is also supported via `--diarize-model`. **Both are gated repos** — visit the model page once and click "Agree and access repository" before running diarization, otherwise the pipeline aborts with a 403 GatedRepo error.
+- For the speaker-embedding cache (used by `transcript-learn`): the pipeline also fetches [pyannote/wespeaker-voxceleb-resnet34-LM](https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM) when diarization is enabled. The pre-flight check warns if access is missing; if it is, the embedding cache is skipped non-fatally and the rest of the pipeline proceeds.
 
 ## Installation
 
@@ -191,6 +193,16 @@ See [Project config file](#project-config-file) for the full schema.
 | `--speaker-map "L0=Name0,L1=Name1"` | Inline label→name map |
 | `--speaker-map-file PATH` | YAML or JSON sidecar |
 
+**Speaker auto-identification** (opt-in; requires diarization)
+
+| Flag | Description |
+|------|-------------|
+| `--identify-speakers` | After diarization, match each cluster against the voice DB and populate `speaker_identities` in the JSON. Off by default. |
+| `--voice-db PATH` | Override the default DB location (`~/.local/share/transcript-video/voices.json`). |
+| `--id-threshold FLOAT` | Cosine-similarity threshold (default `0.65`). Higher = fewer false positives. |
+
+`--speaker-map` keeps final-authority semantics: any label the user maps wins (recorded as `source="manual"` in the JSON). Below-threshold clusters are left unidentified — never silently mislabeled.
+
 **Outputs** — JSON is always produced:
 
 | Flag | Description |
@@ -230,6 +242,9 @@ transcript-to-md PATH/TO/foo_transcript.json \
 | `--paragraph-chars N` | Break long speaker blocks into paragraphs at sentence boundaries when the running paragraph exceeds N characters (default 400; `0` disables splitting) |
 | `--mark-suspect` | Inline `[?]` marker before each segment flagged as suspect (low ASR confidence or high silence probability) |
 | `--list-speakers` | Print a per-speaker overview (label, name, duration, %, turns, suspect count, first words) and exit without writing Markdown. Use this to figure out who is who before filling in `--speaker-map`. |
+| `--identify-speakers` | Refresh `speaker_identities` against the current voice DB before rendering. Torch-free — no GPU or model download. Manual entries survive; auto entries get re-matched. |
+| `--voice-db PATH` | Override the default DB location for `--identify-speakers`. |
+| `--id-threshold FLOAT` | Cosine-similarity threshold for `--identify-speakers` (default `0.65`). |
 | `--config PATH` / `--profile NAME` | See [Project config file](#project-config-file). |
 | `-q`, `--quiet` / `-v`, `--verbose` | Output verbosity. |
 
@@ -251,6 +266,81 @@ transcript-to-md video_transcript.json \
   --tag openshift --tag retro
 ```
 
+### Speaker enrollment and auto-identification
+
+The voice-print database is a single JSON file under your home (default `~/.local/share/transcript-video/voices.json` — XDG-compliant). Three pieces wire it together:
+
+1. The pipeline caches per-cluster embeddings in every transcribed JSON (`speaker_clusters`, schema v2) — no opt-in needed.
+2. `transcript-learn` consumes those embeddings to enroll speakers into the DB.
+3. `--identify-speakers` (on both `transcript-from-video` and `transcript-to-md`) consults the DB to auto-label recurring speakers.
+
+The full loop:
+
+```bash
+# 1. First video: transcribe, then label manually once.
+transcript-from-video ep1.mp4
+transcript-to-md ep1_transcript.json --list-speakers   # see who is SPEAKER_00, SPEAKER_01
+transcript-learn ep1_transcript.json \
+  --speaker-map "SPEAKER_00=Mario,SPEAKER_01=Luca"
+
+# 2. Future videos: auto-identify those speakers.
+transcript-from-video ep2.mp4 --identify-speakers --md
+#  → the rendered Markdown labels SPEAKER_XX clusters that match the DB
+
+# 3. Retroactively re-label old transcripts (no GPU needed):
+transcript-to-md ep0_transcript.json --identify-speakers --md
+```
+
+**Identity precedence at render time** (highest to lowest):
+
+1. CLI `--speaker-map` / `--speaker-map-file` — always wins.
+2. JSON `speaker_identities` entries with `source="manual"` — recorded when `--speaker-map` was passed at transcribe time.
+3. JSON `speaker_identities` entries with `source="auto"` — DB matches above threshold.
+4. The raw `SPEAKER_XX` label — when nothing else identifies the cluster.
+
+Below-threshold clusters never receive a silent auto-label — they keep their `SPEAKER_XX` label and are visible as unidentified.
+
+The database is a single JSON file, sync-friendly: back it up, share between machines, version-control it alongside project notes. Overridable via `--voice-db PATH` or the `TRANSCRIPT_VIDEO_VOICE_DB` environment variable on every binary that touches it.
+
+#### `transcript-learn`
+
+Append speakers from a transcript JSON to the database.
+
+```bash
+transcript-learn video_transcript.json \
+  --speaker-map "SPEAKER_00=Mario,SPEAKER_01=Luca"
+```
+
+| Flag | Description |
+|------|-------------|
+| `JSON_PATH` | The `*_transcript.json` produced by `transcript-from-video` (schema version ≥ 2). |
+| `--speaker-map "L0=Name,..."` | Inline label-to-name map. |
+| `--speaker-map-file PATH` | YAML or JSON sidecar (same shape as `transcript-from-video`'s sidecar). |
+| `--voice-db PATH` | Override the default DB location. |
+| `--dry-run` | Print what would be added; don't write the DB. |
+| `-q`, `--quiet` / `-v`, `--verbose` | Output verbosity. |
+
+Labels in `--speaker-map` that don't match any cluster in the JSON (typos, or speakers from a different video) are reported and skipped — they don't fail the operation. Re-running `transcript-learn` on the same speaker across different videos accumulates samples: the more videos the speaker appears in, the more robust their voice print becomes.
+
+#### `transcript-voices`
+
+Inspect and maintain the database.
+
+```bash
+transcript-voices                  # list enrolled speakers (default)
+transcript-voices show Mario       # sample-by-sample detail
+transcript-voices forget Mario     # remove Mario (prompts y/N)
+transcript-voices forget Mario --source ep1_transcript.json --yes
+```
+
+| Sub-command | Description |
+|-------------|-------------|
+| `list` (default when no sub-command) | One line per enrolled speaker, with sample count and embedding model. |
+| `show NAME` | Per-sample detail: source transcript, cluster label, duration, when added. |
+| `forget NAME [--source X] [-y]` | Remove a speaker entirely, or just samples from a given source. Prompts for confirmation unless `-y`/`--yes`. |
+
+All sub-commands accept `--voice-db PATH` to override the default location.
+
 ## Outputs
 
 All outputs default to the input directory with the suffix `_transcript`. With `--basename my_meeting`, files become `my_meeting_transcript.{json,srt,txt,md}`.
@@ -259,7 +349,8 @@ All outputs default to the input directory with the suffix `_transcript`. With `
 
 ```jsonc
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "stage": "complete",
   "source_file": "/abs/path/video.mp4",
   "transcribed_at": "2026-05-05T10:30:00",
   "parameters": {
@@ -283,6 +374,19 @@ All outputs default to the input directory with the suffix `_transcript`. With `
   },
   "audio_info": { "language_detected": "it", "language_probability": 0.98, "duration_seconds": 6135.2 },
   "stats": { "num_segments": 450, "num_speakers": 2, "processing_seconds": 180.3 },
+  "speaker_clusters": {
+    "SPEAKER_00": {
+      "embedding": [0.234, -0.112, "...(256 floats)"],
+      "duration_s": 3611.6,
+      "n_segments": 261,
+      "embedding_model": "pyannote/wespeaker-voxceleb-resnet34-LM"
+    },
+    "SPEAKER_01": { "...": "..." }
+  },
+  "speaker_identities": {
+    "SPEAKER_00": { "name": "Mario", "score": 0.81, "source": "auto" },
+    "SPEAKER_01": { "name": "Luca",  "score": null, "source": "manual" }
+  },
   "segments": [
     {
       "id": 0,
@@ -296,6 +400,8 @@ All outputs default to the input directory with the suffix `_transcript`. With `
   "full_text": "Allora, oggi parliamo...\n..."
 }
 ```
+
+`speaker_clusters` is populated only when diarization is enabled and the embedding extraction succeeds; otherwise empty `{}`. It's the cache read by `transcript-learn` and by `--identify-speakers`. `speaker_identities` is populated only when `--identify-speakers` was passed (at pipeline time or re-render time); each entry tracks whether it came from the DB (`source: "auto"`) or from an explicit `--speaker-map` (`source: "manual"`). See [Speaker enrollment and auto-identification](#speaker-enrollment-and-auto-identification).
 
 ### Markdown
 

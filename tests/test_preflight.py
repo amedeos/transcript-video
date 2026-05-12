@@ -7,17 +7,20 @@ import types
 
 import pytest
 
-from transcript_video.config import DiarizationConfig, RunConfig
+from transcript_video.config import DiarizationConfig, IdentifyConfig, RunConfig
 from transcript_video.preflight import (
     CheckResult,
     check_cuda,
     check_diarize_model_access,
+    check_embedding_model_access,
     check_ffmpeg,
     check_hf_token,
+    check_identify_db,
     check_whisperx_api,
     report_results,
     run_preflight,
 )
+from transcript_video.speaker_db import save_db
 
 
 @pytest.fixture
@@ -227,6 +230,93 @@ class TestCheckDiarizeModelAccess:
         assert not r.ok and "Agree" in r.message
 
 
+class TestCheckEmbeddingModelAccess:
+    def test_no_token_skipped(self):
+        r = check_embedding_model_access(None, "pyannote/foo")
+        assert r.ok and "skipped" in r.message
+
+    def test_accessible(self, monkeypatch):
+        class FakeApi:
+            def model_info(self, mid, token):
+                return {"id": mid}
+
+        fake_hub = types.ModuleType("huggingface_hub")
+        fake_hub.HfApi = FakeApi
+        monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+        r = check_embedding_model_access("hf_xxx", "pyannote/wespeaker-foo")
+        assert r.ok and "pyannote/wespeaker-foo" in r.message
+
+    def test_uses_default_when_model_id_none(self, monkeypatch):
+        seen = {}
+
+        class FakeApi:
+            def model_info(self, mid, token):
+                seen["mid"] = mid
+                return {"id": mid}
+
+        fake_hub = types.ModuleType("huggingface_hub")
+        fake_hub.HfApi = FakeApi
+        monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+        r = check_embedding_model_access("hf_xxx", None)
+        assert r.ok
+        # The default embedding model is the wespeaker checkpoint.
+        assert "wespeaker" in seen["mid"]
+
+    def test_gated_403(self, monkeypatch):
+        class GatedRepoError(Exception):
+            pass
+
+        class FakeApi:
+            def model_info(self, mid, token):
+                raise GatedRepoError("403 access denied")
+
+        fake_hub = types.ModuleType("huggingface_hub")
+        fake_hub.HfApi = FakeApi
+        monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+        r = check_embedding_model_access("hf_xxx", "pyannote/wespeaker-foo")
+        assert not r.ok and "Agree" in r.message
+
+
+class TestCheckIdentifyDb:
+    def test_missing_db_treated_as_empty(self, tmp_path):
+        # cold start: missing file is OK, just means the DB hasn't been used yet.
+        r = check_identify_db(tmp_path / "absent.json")
+        assert r.ok
+        assert "empty" in r.message
+
+    def test_populated_db(self, tmp_path):
+        from transcript_video.speaker_embed import DEFAULT_EMBEDDING_MODEL
+
+        path = tmp_path / "voices.json"
+        save_db({
+            "schema_version": 1,
+            "embedding_model": DEFAULT_EMBEDDING_MODEL,
+            "speakers": {"Mario": [{"embedding": [0.1], "source": "x"}]},
+        }, path)
+        r = check_identify_db(path)
+        assert r.ok
+        assert "1 speaker" in r.message
+
+    def test_model_mismatch_fails(self, tmp_path):
+        path = tmp_path / "voices.json"
+        save_db({
+            "schema_version": 1,
+            "embedding_model": "old-model",
+            "speakers": {"X": [{"embedding": [0.1], "source": "s"}]},
+        }, path)
+        r = check_identify_db(path)
+        assert not r.ok
+        assert "old-model" in r.message
+        assert "fresh --voice-db" in r.message or "start over" in r.message
+
+    def test_malformed_db_fails(self, tmp_path):
+        path = tmp_path / "voices.json"
+        path.write_text("not valid json", encoding="utf-8")
+        r = check_identify_db(path)
+        assert not r.ok
+        assert "could not load" in r.message
+
+
 class TestRunPreflight:
     def test_diarization_disabled_skips_token_checks(self, cfg, monkeypatch):
         monkeypatch.setattr(
@@ -245,6 +335,7 @@ class TestRunPreflight:
         names = [r.name for r in results]
         assert "hf_token" not in names
         assert "diarize_model_access" not in names
+        assert "embedding_model_access" not in names
 
     def test_offline_skips_network_checks(self, cfg, monkeypatch):
         monkeypatch.setattr(
@@ -265,8 +356,78 @@ class TestRunPreflight:
         names = [r.name for r in results]
         # Token presence still checked offline.
         assert "hf_token" in names
-        # Network-only check skipped.
+        # Network-only checks skipped.
         assert "diarize_model_access" not in names
+        assert "embedding_model_access" not in names
+
+    def test_diarization_enabled_includes_embedding_check(self, cfg, monkeypatch):
+        monkeypatch.setattr(
+            "transcript_video.preflight.shutil.which", lambda _: "/usr/bin/ffmpeg"
+        )
+        monkeypatch.setattr(
+            "transcript_video.preflight.asr_mod.check_cuda_available", lambda: (True, "float16")
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "whisperx",
+            types.SimpleNamespace(DiarizationPipeline=type("X", (), {})),
+        )
+        monkeypatch.setattr(
+            "transcript_video.preflight.diarize_mod.resolve_hf_token", lambda _: "hf_xxx"
+        )
+
+        class FakeApi:
+            def whoami(self, token):
+                return {"name": "u"}
+
+            def model_info(self, mid, token):
+                return {"id": mid}
+
+        fake_hub = types.ModuleType("huggingface_hub")
+        fake_hub.HfApi = FakeApi
+        monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+
+        cfg.diarization = DiarizationConfig(enabled=True)
+        results = run_preflight(cfg, network=True)
+        names = [r.name for r in results]
+        assert "diarize_model_access" in names
+        assert "embedding_model_access" in names
+
+    def test_identify_enabled_includes_db_check(self, cfg, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "transcript_video.preflight.shutil.which", lambda _: "/usr/bin/ffmpeg"
+        )
+        monkeypatch.setattr(
+            "transcript_video.preflight.asr_mod.check_cuda_available", lambda: (True, "float16")
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "whisperx",
+            types.SimpleNamespace(DiarizationPipeline=type("X", (), {})),
+        )
+
+        cfg.identify = IdentifyConfig(enabled=True, voice_db=tmp_path / "voices.json")
+        # Offline so we don't depend on huggingface_hub mocking here.
+        results = run_preflight(cfg, network=False)
+        names = [r.name for r in results]
+        assert "identify_db" in names
+
+    def test_identify_disabled_skips_db_check(self, cfg, monkeypatch):
+        monkeypatch.setattr(
+            "transcript_video.preflight.shutil.which", lambda _: "/usr/bin/ffmpeg"
+        )
+        monkeypatch.setattr(
+            "transcript_video.preflight.asr_mod.check_cuda_available", lambda: (True, "float16")
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "whisperx",
+            types.SimpleNamespace(DiarizationPipeline=type("X", (), {})),
+        )
+        # identify defaults to disabled.
+        results = run_preflight(cfg, network=False)
+        names = [r.name for r in results]
+        assert "identify_db" not in names
 
 
 class TestReportResults:

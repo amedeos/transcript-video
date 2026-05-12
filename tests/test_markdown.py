@@ -15,6 +15,7 @@ from transcript_video.markdown import (
     _group_segments,
     _resolved_language,
     _yaml_inline_value,
+    build_effective_speaker_map,
     load_transcript_json,
     render_body,
     render_frontmatter,
@@ -313,6 +314,94 @@ class TestRenderMarkdown:
         md = render_markdown(t, speaker_map={}, fm_date="2026-05-01", tags=[], fm_source=None)
         assert md.startswith("---\n")
         assert md.rstrip().endswith("---")
+
+    def test_speaker_identities_used_as_fallback(self):
+        """When the JSON carries speaker_identities and the CLI passes no map,
+        the identity names are used for headings and frontmatter."""
+        t = _base_transcript()
+        t["speaker_identities"] = {
+            "SPEAKER_00": {"name": "Amedeo", "score": 0.81, "source": "auto"},
+            "SPEAKER_01": {"name": "Tizio", "score": 0.77, "source": "auto"},
+        }
+        md = render_markdown(t, speaker_map={}, fm_date="2026-05-01", tags=[], fm_source=None)
+        assert "## [00:00:12] Amedeo" in md
+        assert "## [00:01:45] Tizio" in md
+        # Frontmatter also reflects auto-id.
+        assert "SPEAKER_00: Amedeo" in md
+        assert "SPEAKER_01: Tizio" in md
+
+    def test_cli_speaker_map_overrides_speaker_identities(self):
+        """The CLI/config speaker_map keeps its final-authority semantics."""
+        t = _base_transcript()
+        t["speaker_identities"] = {
+            "SPEAKER_00": {"name": "Amedeo", "score": 0.81, "source": "auto"},
+            "SPEAKER_01": {"name": "Tizio", "score": 0.77, "source": "auto"},
+        }
+        md = render_markdown(
+            t,
+            speaker_map={"SPEAKER_00": "Mario"},  # overrides "Amedeo"
+            fm_date="2026-05-01", tags=[], fm_source=None,
+        )
+        # SPEAKER_00 → CLI wins.
+        assert "## [00:00:12] Mario" in md
+        assert "Amedeo" not in md
+        # SPEAKER_01 → identity fallback still kicks in.
+        assert "## [00:01:45] Tizio" in md
+
+    def test_no_identities_field_behaves_as_before(self):
+        """Backwards compatibility: transcripts without speaker_identities render exactly as before."""
+        t = _base_transcript()
+        assert "speaker_identities" not in t
+        md = render_markdown(
+            t,
+            speaker_map={"SPEAKER_00": "Mario"},
+            fm_date="2026-05-01", tags=[], fm_source=None,
+        )
+        assert "## [00:00:12] Mario" in md
+        # SPEAKER_01 has no mapping, so the raw label survives.
+        assert "## [00:01:45] SPEAKER_01" in md
+
+
+class TestBuildEffectiveSpeakerMap:
+    def test_empty_inputs_return_empty(self):
+        assert build_effective_speaker_map({}, None) == {}
+        assert build_effective_speaker_map({}, {}) == {}
+
+    def test_speaker_identities_only(self):
+        t = {"speaker_identities": {
+            "SPEAKER_00": {"name": "Mario", "score": 0.8, "source": "auto"},
+            "SPEAKER_01": {"name": "Luca", "score": 0.9, "source": "manual"},
+        }}
+        result = build_effective_speaker_map(t, None)
+        assert result == {"SPEAKER_00": "Mario", "SPEAKER_01": "Luca"}
+
+    def test_cli_map_wins_on_overlap(self):
+        t = {"speaker_identities": {
+            "SPEAKER_00": {"name": "Mario", "score": 0.8, "source": "auto"},
+        }}
+        result = build_effective_speaker_map(t, {"SPEAKER_00": "Luca"})
+        assert result == {"SPEAKER_00": "Luca"}
+
+    def test_cli_extends_identities(self):
+        t = {"speaker_identities": {
+            "SPEAKER_00": {"name": "Mario", "source": "auto"},
+        }}
+        result = build_effective_speaker_map(t, {"SPEAKER_99": "Ghost"})
+        assert result == {"SPEAKER_00": "Mario", "SPEAKER_99": "Ghost"}
+
+    def test_malformed_identity_skipped(self):
+        t = {"speaker_identities": {
+            "SPEAKER_00": {"name": "Mario", "source": "auto"},
+            "SPEAKER_01": "not-a-dict",
+            "SPEAKER_02": {"source": "auto"},  # no name
+            "SPEAKER_03": {"name": "", "source": "auto"},  # empty name
+        }}
+        result = build_effective_speaker_map(t, None)
+        assert result == {"SPEAKER_00": "Mario"}
+
+    def test_missing_field_safe(self):
+        # Transcript with no speaker_identities at all.
+        assert build_effective_speaker_map({"foo": "bar"}, {"S": "Mario"}) == {"S": "Mario"}
 
 
 class TestLoadTranscriptJson:

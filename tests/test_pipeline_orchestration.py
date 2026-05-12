@@ -21,9 +21,11 @@ from transcript_video import pipeline as pipeline_mod
 from transcript_video.config import (
     DiarizationConfig,
     FrontmatterConfig,
+    IdentifyConfig,
     OutputConfig,
     RunConfig,
 )
+from transcript_video.speaker_db import add_sample, save_db
 
 
 @pytest.fixture
@@ -74,6 +76,31 @@ def stub_pipeline(monkeypatch, fake_audio):
     monkeypatch.setattr(pipeline_mod.diarize_mod, "diarize_and_assign", _fake_diarize)
     monkeypatch.setattr(pipeline_mod.diarize_mod, "resolve_hf_token", lambda _: "hf_fake")
 
+    def _fake_extract(audio_path, segments, **kwargs):
+        # Build a plausible-shaped clusters dict from whatever speaker labels
+        # show up in the segments. Embeddings are tiny but well-formed.
+        seen: dict[str, dict] = {}
+        for s in segments:
+            label = s.get("speaker")
+            if not label:
+                continue
+            entry = seen.setdefault(
+                label,
+                {
+                    "embedding": [0.1, 0.2, 0.3],
+                    "duration_s": 0.0,
+                    "n_segments": 0,
+                    "embedding_model": "pyannote/fake-embedding",
+                },
+            )
+            entry["duration_s"] += float(s.get("end", 0.0)) - float(s.get("start", 0.0))
+            entry["n_segments"] += 1
+        return seen
+
+    monkeypatch.setattr(
+        pipeline_mod.speaker_embed_mod, "extract_cluster_embeddings", _fake_extract
+    )
+
 
 def _config(input_file: Path, *, write_md=True) -> RunConfig:
     return RunConfig(
@@ -103,6 +130,35 @@ class TestRunPipelineHappyPath:
         md = written["md"].read_text(encoding="utf-8")
         assert "## [00:00:00] SPEAKER_00" in md
 
+    def test_schema_version_is_two(self, stub_pipeline, fake_input):
+        config = _config(fake_input, write_md=False)
+        written = pipeline_mod.run_pipeline(config)
+        final = json.loads(written["json"].read_text(encoding="utf-8"))
+        assert final["schema_version"] == 2
+
+    def test_speaker_clusters_cached_in_complete_payload(self, stub_pipeline, fake_input):
+        config = _config(fake_input, write_md=False)
+        written = pipeline_mod.run_pipeline(config)
+        final = json.loads(written["json"].read_text(encoding="utf-8"))
+        clusters = final["speaker_clusters"]
+        assert set(clusters.keys()) == {"SPEAKER_00", "SPEAKER_01"}
+        for info in clusters.values():
+            assert isinstance(info["embedding"], list)
+            assert info["embedding"]  # non-empty
+            assert info["n_segments"] >= 1
+            assert info["duration_s"] > 0
+            assert info["embedding_model"]
+
+    def test_aligned_snapshot_has_empty_clusters(self, stub_pipeline, fake_input, tmp_path):
+        config = _config(fake_input, write_md=False)
+        pipeline_mod.run_pipeline(config)
+        aligned = json.loads(
+            (tmp_path / "video_transcript.aligned.json").read_text(encoding="utf-8")
+        )
+        # Aligned stage runs before diarization → no clusters.
+        assert aligned["schema_version"] == 2
+        assert aligned["speaker_clusters"] == {}
+
     def test_no_diarize_skips_aligned_snapshot(self, stub_pipeline, fake_input, tmp_path):
         config = _config(fake_input)
         config.diarization = DiarizationConfig(enabled=False)
@@ -112,6 +168,136 @@ class TestRunPipelineHappyPath:
         assert not (tmp_path / "video_transcript.aligned.json").exists()
         # Final JSON still produced.
         assert (tmp_path / "video_transcript.json").exists()
+
+    def test_no_diarize_final_has_empty_clusters(self, stub_pipeline, fake_input, tmp_path):
+        config = _config(fake_input, write_md=False)
+        config.diarization = DiarizationConfig(enabled=False)
+        pipeline_mod.run_pipeline(config)
+        final = json.loads(
+            (tmp_path / "video_transcript.json").read_text(encoding="utf-8")
+        )
+        assert final["speaker_clusters"] == {}
+
+    def test_embedding_extraction_failure_does_not_crash(
+        self, stub_pipeline, fake_input, tmp_path, monkeypatch
+    ):
+        def boom(*a, **kw):
+            raise RuntimeError("simulated embedding model failure")
+
+        monkeypatch.setattr(
+            pipeline_mod.speaker_embed_mod, "extract_cluster_embeddings", boom
+        )
+
+        config = _config(fake_input, write_md=False)
+        written = pipeline_mod.run_pipeline(config)
+        final = json.loads(written["json"].read_text(encoding="utf-8"))
+        # Pipeline succeeded, transcript is intact, only clusters are empty.
+        assert final["stage"] == "complete"
+        assert final["speaker_clusters"] == {}
+        assert len(final["segments"]) >= 1
+
+
+def _seed_voice_db(path, mapping: dict[str, list[float]], *, model: str = "pyannote/fake-embedding") -> None:
+    """Write a voice DB at ``path`` populated with one sample per name in ``mapping``."""
+    db = {"schema_version": 1, "embedding_model": model, "speakers": {}}
+    for name, embedding in mapping.items():
+        add_sample(
+            db, name, embedding,
+            source="seed.json", embedding_model=model,
+            cluster="SPEAKER_seed", duration_s=10.0,
+        )
+    save_db(db, path)
+
+
+class TestSpeakerIdentities:
+    def test_disabled_yields_empty_identities(self, stub_pipeline, fake_input):
+        # identify defaults to disabled.
+        config = _config(fake_input, write_md=False)
+        written = pipeline_mod.run_pipeline(config)
+        final = json.loads(written["json"].read_text(encoding="utf-8"))
+        assert final["speaker_identities"] == {}
+
+    def test_enabled_with_matching_db_populates_auto_entries(
+        self, stub_pipeline, fake_input, tmp_path
+    ):
+        # Fake clusters from stub use embedding [0.1, 0.2, 0.3].
+        db_path = tmp_path / "voices.json"
+        _seed_voice_db(db_path, {"Mario": [0.1, 0.2, 0.3]})
+
+        config = _config(fake_input, write_md=False)
+        config.identify = IdentifyConfig(enabled=True, voice_db=db_path, threshold=0.5)
+        written = pipeline_mod.run_pipeline(config)
+        final = json.loads(written["json"].read_text(encoding="utf-8"))
+
+        identities = final["speaker_identities"]
+        # Both clusters use the same embedding in the stub → both match Mario.
+        assert "SPEAKER_00" in identities
+        assert identities["SPEAKER_00"]["name"] == "Mario"
+        assert identities["SPEAKER_00"]["source"] == "auto"
+        assert identities["SPEAKER_00"]["score"] is not None
+
+    def test_manual_speaker_map_overrides_auto(
+        self, stub_pipeline, fake_input, tmp_path
+    ):
+        db_path = tmp_path / "voices.json"
+        _seed_voice_db(db_path, {"AutoName": [0.1, 0.2, 0.3]})
+
+        config = _config(fake_input, write_md=False)
+        config.identify = IdentifyConfig(enabled=True, voice_db=db_path, threshold=0.5)
+        config.speaker_map = {"SPEAKER_00": "ManualName"}
+        written = pipeline_mod.run_pipeline(config)
+        final = json.loads(written["json"].read_text(encoding="utf-8"))
+
+        # SPEAKER_00 was overridden by the CLI map.
+        assert final["speaker_identities"]["SPEAKER_00"] == {
+            "name": "ManualName", "score": None, "source": "manual",
+        }
+        # SPEAKER_01 still gets the auto match (same embedding → AutoName).
+        sp01 = final["speaker_identities"].get("SPEAKER_01")
+        assert sp01 is not None
+        assert sp01["source"] == "auto"
+
+    def test_missing_db_is_non_fatal(self, stub_pipeline, fake_input, tmp_path):
+        # Empty DB (missing file) yields cold-start: no matches, no error.
+        config = _config(fake_input, write_md=False)
+        config.identify = IdentifyConfig(
+            enabled=True, voice_db=tmp_path / "absent.json", threshold=0.5,
+        )
+        written = pipeline_mod.run_pipeline(config)
+        final = json.loads(written["json"].read_text(encoding="utf-8"))
+        # No auto entries (empty DB), no manual entries (no speaker_map), no error.
+        assert final["speaker_identities"] == {}
+
+    def test_incompatible_model_skips_auto_keeps_manual(
+        self, stub_pipeline, fake_input, tmp_path
+    ):
+        db_path = tmp_path / "voices.json"
+        _seed_voice_db(db_path, {"Old": [0.1, 0.2, 0.3]}, model="some-other-model")
+
+        config = _config(fake_input, write_md=False)
+        config.identify = IdentifyConfig(enabled=True, voice_db=db_path, threshold=0.5)
+        config.speaker_map = {"SPEAKER_00": "Manual"}
+        written = pipeline_mod.run_pipeline(config)
+        final = json.loads(written["json"].read_text(encoding="utf-8"))
+
+        # No auto matches (model mismatch), but manual still recorded.
+        identities = final["speaker_identities"]
+        assert identities["SPEAKER_00"] == {
+            "name": "Manual", "score": None, "source": "manual",
+        }
+        assert "SPEAKER_01" not in identities
+
+    def test_below_threshold_no_match(self, stub_pipeline, fake_input, tmp_path):
+        db_path = tmp_path / "voices.json"
+        # Orthogonal to cluster embeddings → cosine 0.
+        _seed_voice_db(db_path, {"Mario": [-0.3, -0.2, -0.1]})
+
+        config = _config(fake_input, write_md=False)
+        config.identify = IdentifyConfig(enabled=True, voice_db=db_path, threshold=0.5)
+        written = pipeline_mod.run_pipeline(config)
+        final = json.loads(written["json"].read_text(encoding="utf-8"))
+        # No cluster matched.
+        assert final["speaker_identities"] == {}
 
 
 class TestRunPipelineDiarizeFailure:

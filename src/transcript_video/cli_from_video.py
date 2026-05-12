@@ -7,7 +7,13 @@ import sys
 from pathlib import Path
 
 from . import project_config
-from .config import DiarizationConfig, FrontmatterConfig, OutputConfig, RunConfig
+from .config import (
+    DiarizationConfig,
+    FrontmatterConfig,
+    IdentifyConfig,
+    OutputConfig,
+    RunConfig,
+)
 from .pipeline import run_pipeline
 from .preflight import report_results, run_preflight
 from .speakers import resolve_speaker_map
@@ -168,6 +174,34 @@ Examples:
         "--speaker-map-file",
         default=None,
         help="YAML or JSON sidecar with the speaker map.",
+    )
+
+    identify_group = parser.add_argument_group("Speaker auto-identification")
+    identify_group.add_argument(
+        "--identify-speakers",
+        action="store_true",
+        help=(
+            "After diarization, auto-match each cluster against the voice-print DB "
+            "(enroll speakers first with transcript-learn). Results are written to "
+            "the JSON's speaker_identities field; --speaker-map still wins per label."
+        ),
+    )
+    identify_group.add_argument(
+        "--voice-db",
+        default=None,
+        help=(
+            "Path to the voice DB used by --identify-speakers. Overrides "
+            "$TRANSCRIPT_VIDEO_VOICE_DB and the XDG default."
+        ),
+    )
+    identify_group.add_argument(
+        "--id-threshold",
+        type=float,
+        default=0.65,
+        help=(
+            "Cosine-similarity threshold for auto-identification (default: 0.65). "
+            "Higher = fewer false positives; lower = more matches."
+        ),
     )
 
     out_group = parser.add_argument_group("Outputs")
@@ -367,11 +401,25 @@ def main(argv: list[str] | None = None) -> None:
             tags=list(args.tags or []),
             source=args.fm_source,
         ),
+        identify=IdentifyConfig(
+            enabled=args.identify_speakers,
+            voice_db=Path(args.voice_db) if args.voice_db else None,
+            threshold=args.id_threshold,
+        ),
         speaker_map=resolve_speaker_map(
             args.speaker_map, args.speaker_map_file, fallback=speaker_map_from_config
         ),
         resume_from_aligned=resume_path,
     )
+
+    # --identify-speakers needs diarized clusters to match against.
+    if args.identify_speakers and args.no_diarize:
+        print(
+            "Warning: --identify-speakers has no effect with --no-diarize "
+            "(no clusters to identify). Continuing without auto-identification.",
+            file=sys.stderr,
+        )
+        config.identify.enabled = False
 
     # --check: run only the pre-flight (with network) and exit 0/1.
     if args.check:

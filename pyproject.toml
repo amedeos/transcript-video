@@ -41,6 +41,8 @@ dev = [
 [project.scripts]
 transcript-from-video = "transcript_video.cli_from_video:main"
 transcript-to-md = "transcript_video.cli_to_md:main"
+transcript-learn = "transcript_video.cli_learn:main"
+transcript-voices = "transcript_video.cli_voices:main"
 
 [project.urls]
 Homepage = "https://github.com/amedeos/transcript-video"
