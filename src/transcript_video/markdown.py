@@ -27,6 +27,34 @@ def load_transcript_json(json_path: str | Path) -> dict[str, Any]:
         return json.load(f)
 
 
+def build_effective_speaker_map(
+    transcript: dict[str, Any], cli_speaker_map: dict[str, str] | None
+) -> dict[str, str]:
+    """Merge JSON's ``speaker_identities`` (fallback) with the CLI map (wins).
+
+    Schema-v2 transcripts may carry a ``speaker_identities`` field populated
+    by ``transcript-from-video --identify-speakers`` (or by an enrollment
+    step). Each entry is ``{name, score, source: "auto" | "manual"}``. The
+    rendering layer treats those names as a fallback: if the user passes
+    ``--speaker-map SPEAKER_00=Luca`` at render time, "Luca" still wins.
+
+    Returns a flat ``{label: name}`` dict ready for the rendering pipeline.
+    Malformed identity entries (missing ``name``, not a dict) are skipped
+    silently — the rest of the map continues to work.
+    """
+    identities = transcript.get("speaker_identities") or {}
+    merged: dict[str, str] = {}
+    for label, info in identities.items():
+        if not isinstance(info, dict):
+            continue
+        name = info.get("name")
+        if name:
+            merged[str(label)] = str(name)
+    if cli_speaker_map:
+        merged.update(cli_speaker_map)
+    return merged
+
+
 def _yaml_quote(value: str) -> str:
     """Quote a value as a YAML double-quoted scalar (escapes ``\\`` and ``"``)."""
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
@@ -264,20 +292,25 @@ def render_markdown(
     mark_suspect: bool = False,
     paragraph_chars: int = 400,
 ) -> str:
-    """Render the full Markdown document (frontmatter + body)."""
-    speaker_map = speaker_map or {}
+    """Render the full Markdown document (frontmatter + body).
+
+    The effective speaker map is the union of the transcript's
+    ``speaker_identities`` (fallback) and ``speaker_map`` (wins). The CLI
+    map therefore retains its final-authority semantics it has always had.
+    """
+    effective_map = build_effective_speaker_map(transcript, speaker_map)
     tags = tags or []
     segments = transcript.get("segments", []) or []
     fm = render_frontmatter(
         transcript,
-        speaker_map=speaker_map,
+        speaker_map=effective_map,
         fm_date=fm_date,
         tags=tags,
         fm_source=fm_source,
     )
     body = render_body(
         segments,
-        speaker_map=speaker_map,
+        speaker_map=effective_map,
         merge_gap_seconds=merge_gap_seconds,
         mark_suspect=mark_suspect,
         paragraph_chars=paragraph_chars,

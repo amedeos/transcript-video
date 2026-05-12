@@ -16,6 +16,7 @@ from transcript_video.speaker_db import (
     DB_SCHEMA_VERSION,
     add_sample,
     all_speaker_names,
+    auto_resolve_speaker_map,
     default_db_path,
     embedding_model_compatible,
     load_db,
@@ -315,6 +316,62 @@ class TestRemoveSpeaker:
     def test_missing_speaker_returns_zero(self):
         db = {"schema_version": 1, "embedding_model": "m", "speakers": {"Mario": []}}
         assert remove_speaker(db, "Ghost") == 0
+
+
+class TestAutoResolveSpeakerMap:
+    def _db(self, speakers: dict[str, list[dict]]) -> dict:
+        return {
+            "schema_version": DB_SCHEMA_VERSION,
+            "embedding_model": "m",
+            "speakers": speakers,
+        }
+
+    def test_no_clusters_returns_empty(self):
+        db = self._db({"Mario": [{"embedding": [1.0, 0.0], "source": "s"}]})
+        assert auto_resolve_speaker_map({}, db) == {}
+
+    def test_empty_db_returns_empty(self):
+        clusters = {"SPEAKER_00": {"embedding": [1.0, 0.0], "duration_s": 10}}
+        empty = {"schema_version": 1, "embedding_model": None, "speakers": {}}
+        assert auto_resolve_speaker_map(clusters, empty) == {}
+
+    def test_matches_above_threshold(self):
+        db = self._db({"Mario": [{"embedding": [1.0, 0.0], "source": "s"}]})
+        clusters = {"SPEAKER_00": {"embedding": [1.0, 0.0], "duration_s": 10}}
+        result = auto_resolve_speaker_map(clusters, db, threshold=0.5)
+        assert "SPEAKER_00" in result
+        assert result["SPEAKER_00"]["name"] == "Mario"
+        assert result["SPEAKER_00"]["score"] == pytest.approx(1.0)
+        assert result["SPEAKER_00"]["n_samples"] == 1
+
+    def test_omits_clusters_below_threshold(self):
+        db = self._db({"Mario": [{"embedding": [1.0, 0.0], "source": "s"}]})
+        clusters = {"SPEAKER_00": {"embedding": [0.0, 1.0], "duration_s": 10}}  # orthogonal
+        assert auto_resolve_speaker_map(clusters, db, threshold=0.5) == {}
+
+    def test_picks_correct_speaker_per_cluster(self):
+        db = self._db({
+            "Mario": [{"embedding": [1.0, 0.0], "source": "s"}],
+            "Luca":  [{"embedding": [0.0, 1.0], "source": "s"}],
+        })
+        clusters = {
+            "SPEAKER_00": {"embedding": [1.0, 0.0], "duration_s": 5},
+            "SPEAKER_01": {"embedding": [0.0, 1.0], "duration_s": 5},
+        }
+        result = auto_resolve_speaker_map(clusters, db, threshold=0.5)
+        assert result["SPEAKER_00"]["name"] == "Mario"
+        assert result["SPEAKER_01"]["name"] == "Luca"
+
+    def test_skips_malformed_cluster(self):
+        db = self._db({"Mario": [{"embedding": [1.0, 0.0], "source": "s"}]})
+        clusters = {
+            "SPEAKER_00": {"embedding": [1.0, 0.0], "duration_s": 5},
+            "SPEAKER_01": "not-a-dict",  # malformed
+            "SPEAKER_02": {"embedding": []},  # empty embedding
+            "SPEAKER_03": {"duration_s": 5},  # missing embedding
+        }
+        result = auto_resolve_speaker_map(clusters, db, threshold=0.5)
+        assert set(result.keys()) == {"SPEAKER_00"}
 
 
 class TestRemoveSample:

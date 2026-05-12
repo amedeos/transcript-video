@@ -11,7 +11,12 @@ import sys
 from pathlib import Path
 
 from . import project_config
-from .markdown import load_transcript_json, render_markdown, write_markdown
+from .markdown import (
+    build_effective_speaker_map,
+    load_transcript_json,
+    render_markdown,
+    write_markdown,
+)
 from .speakers import display_name, resolve_speaker_map
 from .stats import compute_speaker_stats
 from .utils import format_timestamp_hms, setup_logging, silence_known_noisy_warnings
@@ -160,12 +165,13 @@ def _format_speaker_overview(transcript: dict, speaker_map: dict[str, str]) -> s
     if not stats:
         return "No speakers detected (diarization disabled or no diarization data in JSON)."
 
+    effective_map = build_effective_speaker_map(transcript, speaker_map)
     rows = []
     for label, bucket in stats.items():
         rows.append(
             (
                 label,
-                display_name(label, speaker_map),
+                display_name(label, effective_map),
                 format_timestamp_hms(float(bucket.get("duration_seconds") or 0.0)),
                 f"{float(bucket.get('percentage') or 0.0):5.1f}%",
                 str(bucket.get("num_turns") or 0),
