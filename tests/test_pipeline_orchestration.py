@@ -74,6 +74,31 @@ def stub_pipeline(monkeypatch, fake_audio):
     monkeypatch.setattr(pipeline_mod.diarize_mod, "diarize_and_assign", _fake_diarize)
     monkeypatch.setattr(pipeline_mod.diarize_mod, "resolve_hf_token", lambda _: "hf_fake")
 
+    def _fake_extract(audio_path, segments, **kwargs):
+        # Build a plausible-shaped clusters dict from whatever speaker labels
+        # show up in the segments. Embeddings are tiny but well-formed.
+        seen: dict[str, dict] = {}
+        for s in segments:
+            label = s.get("speaker")
+            if not label:
+                continue
+            entry = seen.setdefault(
+                label,
+                {
+                    "embedding": [0.1, 0.2, 0.3],
+                    "duration_s": 0.0,
+                    "n_segments": 0,
+                    "embedding_model": "pyannote/fake-embedding",
+                },
+            )
+            entry["duration_s"] += float(s.get("end", 0.0)) - float(s.get("start", 0.0))
+            entry["n_segments"] += 1
+        return seen
+
+    monkeypatch.setattr(
+        pipeline_mod.speaker_embed_mod, "extract_cluster_embeddings", _fake_extract
+    )
+
 
 def _config(input_file: Path, *, write_md=True) -> RunConfig:
     return RunConfig(
@@ -103,6 +128,35 @@ class TestRunPipelineHappyPath:
         md = written["md"].read_text(encoding="utf-8")
         assert "## [00:00:00] SPEAKER_00" in md
 
+    def test_schema_version_is_two(self, stub_pipeline, fake_input):
+        config = _config(fake_input, write_md=False)
+        written = pipeline_mod.run_pipeline(config)
+        final = json.loads(written["json"].read_text(encoding="utf-8"))
+        assert final["schema_version"] == 2
+
+    def test_speaker_clusters_cached_in_complete_payload(self, stub_pipeline, fake_input):
+        config = _config(fake_input, write_md=False)
+        written = pipeline_mod.run_pipeline(config)
+        final = json.loads(written["json"].read_text(encoding="utf-8"))
+        clusters = final["speaker_clusters"]
+        assert set(clusters.keys()) == {"SPEAKER_00", "SPEAKER_01"}
+        for info in clusters.values():
+            assert isinstance(info["embedding"], list)
+            assert info["embedding"]  # non-empty
+            assert info["n_segments"] >= 1
+            assert info["duration_s"] > 0
+            assert info["embedding_model"]
+
+    def test_aligned_snapshot_has_empty_clusters(self, stub_pipeline, fake_input, tmp_path):
+        config = _config(fake_input, write_md=False)
+        pipeline_mod.run_pipeline(config)
+        aligned = json.loads(
+            (tmp_path / "video_transcript.aligned.json").read_text(encoding="utf-8")
+        )
+        # Aligned stage runs before diarization → no clusters.
+        assert aligned["schema_version"] == 2
+        assert aligned["speaker_clusters"] == {}
+
     def test_no_diarize_skips_aligned_snapshot(self, stub_pipeline, fake_input, tmp_path):
         config = _config(fake_input)
         config.diarization = DiarizationConfig(enabled=False)
@@ -112,6 +166,33 @@ class TestRunPipelineHappyPath:
         assert not (tmp_path / "video_transcript.aligned.json").exists()
         # Final JSON still produced.
         assert (tmp_path / "video_transcript.json").exists()
+
+    def test_no_diarize_final_has_empty_clusters(self, stub_pipeline, fake_input, tmp_path):
+        config = _config(fake_input, write_md=False)
+        config.diarization = DiarizationConfig(enabled=False)
+        pipeline_mod.run_pipeline(config)
+        final = json.loads(
+            (tmp_path / "video_transcript.json").read_text(encoding="utf-8")
+        )
+        assert final["speaker_clusters"] == {}
+
+    def test_embedding_extraction_failure_does_not_crash(
+        self, stub_pipeline, fake_input, tmp_path, monkeypatch
+    ):
+        def boom(*a, **kw):
+            raise RuntimeError("simulated embedding model failure")
+
+        monkeypatch.setattr(
+            pipeline_mod.speaker_embed_mod, "extract_cluster_embeddings", boom
+        )
+
+        config = _config(fake_input, write_md=False)
+        written = pipeline_mod.run_pipeline(config)
+        final = json.loads(written["json"].read_text(encoding="utf-8"))
+        # Pipeline succeeded, transcript is intact, only clusters are empty.
+        assert final["stage"] == "complete"
+        assert final["speaker_clusters"] == {}
+        assert len(final["segments"]) >= 1
 
 
 class TestRunPipelineDiarizeFailure:

@@ -22,6 +22,7 @@ from typing import Any
 
 from . import asr as asr_mod
 from . import diarize as diarize_mod
+from . import speaker_embed as speaker_embed_mod
 from . import stats as stats_mod
 from .config import RunConfig
 from .markdown import render_markdown, write_markdown
@@ -98,15 +99,25 @@ def _build_payload(
     language_probability: float | None,
     segments: list[dict[str, Any]],
     processing_seconds: float,
+    speaker_clusters: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the canonical JSON payload. Used for both aligned and complete stages."""
+    """Build the canonical JSON payload. Used for both aligned and complete stages.
+
+    ``speaker_clusters`` is the per-speaker embedding cache produced by
+    :mod:`speaker_embed` after diarization. Aligned-stage and no-diarize-stage
+    payloads carry an empty dict here.
+
+    Schema version 2 added the ``speaker_clusters`` field. Consumers that only
+    look at ``segments`` / ``parameters`` / ``stats`` (notably :mod:`markdown`)
+    are forward- and backward-compatible without changes.
+    """
     duration_seconds = float(segments[-1].get("end") or 0.0) if segments else 0.0
     # Annotate segments with `suspect` / `suspect_reasons` before computing the
     # per-speaker breakdown so num_suspect picks them up. Mutates segments in
     # place; idempotent on resume because the same thresholds always apply.
     stats_mod.mark_suspect_segments(segments)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "stage": stage,
         "source_file": str(source_file),
         "transcribed_at": transcribed_at.isoformat(timespec="seconds"),
@@ -149,6 +160,7 @@ def _build_payload(
             "processing_seconds": processing_seconds,
             "speakers": stats_mod.compute_speaker_stats(segments),
         },
+        "speaker_clusters": speaker_clusters or {},
         "segments": segments,
         "full_text": "\n".join(seg["text"] for seg in segments if seg.get("text")),
     }
@@ -274,6 +286,29 @@ def _diarize_payload(payload: dict[str, Any], config: RunConfig) -> dict[str, An
     )
     diarized_segments = [_normalize_segment(s) for s in diarized.get("segments", [])]
 
+    # Best-effort cluster-embedding extraction. Failure is logged and the
+    # pipeline continues with an empty `speaker_clusters`; the transcript is
+    # still useful, only the future auto-identification capability is lost
+    # for this run (and can be recovered by re-processing).
+    speaker_clusters: dict[str, Any] = {}
+    if token and diarized_segments:
+        try:
+            logger.info("Extracting per-cluster speaker embeddings...")
+            speaker_clusters = speaker_embed_mod.extract_cluster_embeddings(
+                input_path,
+                diarized_segments,
+                hf_token=token,
+                device=device,
+            )
+            logger.info(
+                "Cached embeddings for %d cluster(s).", len(speaker_clusters)
+            )
+        except Exception as e:
+            logger.warning(
+                "Speaker embedding extraction failed: %s. "
+                "Cluster embeddings will not be cached for this run.", e,
+            )
+
     return _build_payload(
         stage=STAGE_COMPLETE,
         source_file=input_path,
@@ -285,6 +320,7 @@ def _diarize_payload(payload: dict[str, Any], config: RunConfig) -> dict[str, An
         language_probability=payload["audio_info"].get("language_probability"),
         segments=diarized_segments,
         processing_seconds=float(payload.get("stats", {}).get("processing_seconds") or 0.0),
+        speaker_clusters=speaker_clusters,
     )
 
 

@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 from . import asr as asr_mod
 from . import diarize as diarize_mod
+from . import speaker_embed as speaker_embed_mod
 from .config import RunConfig
 
 logger = logging.getLogger("transcript_video.preflight")
@@ -194,6 +195,42 @@ def check_diarize_model_access(token: str | None, model_id: str | None) -> Check
     return CheckResult("diarize_model_access", True, f"accessible: {target}")
 
 
+def check_embedding_model_access(token: str | None, model_id: str | None) -> CheckResult:
+    """Probe whether the speaker-embedding model is accessible to ``token``.
+
+    Failure here is non-fatal: the pipeline can still produce a transcript
+    without cluster embeddings (auto-identification just becomes unavailable
+    for this run). The check is informational; the user decides whether to
+    fix the access issue before running.
+    """
+    if not token:
+        return CheckResult("embedding_model_access", True, "skipped (no token)")
+
+    target = model_id or speaker_embed_mod.DEFAULT_EMBEDDING_MODEL
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        return CheckResult(
+            "embedding_model_access",
+            True,
+            "skipped (huggingface_hub not installed; cannot verify)",
+        )
+
+    try:
+        HfApi().model_info(target, token=token)
+    except Exception as e:
+        msg = str(e)
+        gated = "GatedRepo" in type(e).__name__ or "403" in msg or "gated" in msg.lower()
+        if gated:
+            return CheckResult(
+                "embedding_model_access",
+                False,
+                f"access denied to {target}; visit https://huggingface.co/{target} and click 'Agree'",
+            )
+        return CheckResult("embedding_model_access", False, f"could not verify {target}: {e}")
+    return CheckResult("embedding_model_access", True, f"accessible: {target}")
+
+
 def run_preflight(config: RunConfig, *, network: bool = True) -> list[CheckResult]:
     """Run all checks relevant to ``config``. Cheap checks first, network last.
 
@@ -213,6 +250,7 @@ def run_preflight(config: RunConfig, *, network: bool = True) -> list[CheckResul
 
     if network and token:
         results.append(check_diarize_model_access(token, config.diarization.model_name))
+        results.append(check_embedding_model_access(token, None))
 
     return results
 
