@@ -15,12 +15,16 @@ import pytest
 from transcript_video.speaker_db import (
     DB_SCHEMA_VERSION,
     add_sample,
+    all_speaker_names,
     default_db_path,
     embedding_model_compatible,
     load_db,
     match,
+    remove_sample,
+    remove_speaker,
     resolve_db_path,
     save_db,
+    speaker_sample_count,
 )
 
 
@@ -276,3 +280,71 @@ class TestEmbeddingModelCompatible:
     def test_different_model_incompatible(self):
         db = {"schema_version": DB_SCHEMA_VERSION, "embedding_model": "m1", "speakers": {}}
         assert not embedding_model_compatible(db, "m2")
+
+
+class TestIntrospection:
+    def test_all_speaker_names_sorted(self):
+        db = {"schema_version": 1, "embedding_model": "m", "speakers": {
+            "Luca": [], "Mario": [], "Anna": [],
+        }}
+        assert all_speaker_names(db) == ["Anna", "Luca", "Mario"]
+
+    def test_all_speaker_names_empty(self):
+        assert all_speaker_names({"speakers": {}}) == []
+        assert all_speaker_names({}) == []
+
+    def test_speaker_sample_count(self):
+        db = {"schema_version": 1, "embedding_model": "m", "speakers": {
+            "Mario": [{"embedding": [0.1]}, {"embedding": [0.2]}, {"embedding": [0.3]}],
+        }}
+        assert speaker_sample_count(db, "Mario") == 3
+        assert speaker_sample_count(db, "Ghost") == 0
+        assert speaker_sample_count({}, "Anyone") == 0
+
+
+class TestRemoveSpeaker:
+    def test_removes_all_samples_returns_count(self):
+        db = {"schema_version": 1, "embedding_model": "m", "speakers": {
+            "Mario": [{"embedding": [0.1]}, {"embedding": [0.2]}],
+            "Luca":  [{"embedding": [0.3]}],
+        }}
+        assert remove_speaker(db, "Mario") == 2
+        assert "Mario" not in db["speakers"]
+        assert "Luca" in db["speakers"], "untouched speakers remain"
+
+    def test_missing_speaker_returns_zero(self):
+        db = {"schema_version": 1, "embedding_model": "m", "speakers": {"Mario": []}}
+        assert remove_speaker(db, "Ghost") == 0
+
+
+class TestRemoveSample:
+    def test_removes_matching_source(self):
+        db = {"schema_version": 1, "embedding_model": "m", "speakers": {
+            "Mario": [
+                {"embedding": [0.1], "source": "ep1"},
+                {"embedding": [0.2], "source": "ep2"},
+                {"embedding": [0.3], "source": "ep1"},
+            ],
+        }}
+        assert remove_sample(db, "Mario", "ep1") == 2
+        remaining = db["speakers"]["Mario"]
+        assert len(remaining) == 1
+        assert remaining[0]["source"] == "ep2"
+
+    def test_no_matching_source_returns_zero(self):
+        db = {"schema_version": 1, "embedding_model": "m", "speakers": {
+            "Mario": [{"embedding": [0.1], "source": "ep1"}],
+        }}
+        assert remove_sample(db, "Mario", "missing.json") == 0
+        assert db["speakers"]["Mario"], "non-matching source must not affect samples"
+
+    def test_removing_last_sample_drops_speaker(self):
+        db = {"schema_version": 1, "embedding_model": "m", "speakers": {
+            "Mario": [{"embedding": [0.1], "source": "ep1"}],
+        }}
+        assert remove_sample(db, "Mario", "ep1") == 1
+        assert "Mario" not in db["speakers"]
+
+    def test_missing_speaker_returns_zero(self):
+        db = {"schema_version": 1, "embedding_model": "m", "speakers": {}}
+        assert remove_sample(db, "Ghost", "anywhere") == 0

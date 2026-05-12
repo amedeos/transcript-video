@@ -20,6 +20,7 @@ This project is the English-language successor of [transcript-italian-video](htt
 - **Per-speaker stats** in the JSON (talk time, percentage, turns, suspect counts) and a `transcript-to-md --list-speakers` overview to help with mapping labels to names.
 - **Suspect-segment flagging**: low-confidence ASR segments are marked in the JSON with `suspect: true` and `suspect_reasons: [...]`. Optional `--mark-suspect` adds an inline `[?]` marker in the rendered Markdown, exactly where the dubious span starts.
 - **Paragraph splitting**: long speaker blocks are broken at sentence boundaries when they exceed `--paragraph-chars` (default 400) — keeps the rendered transcript scannable without fragmenting turns.
+- **Cross-video speaker enrollment** (`transcript-learn` / `transcript-voices`): record who each `SPEAKER_XX` is and maintain a per-user voice-print database. Per-cluster embeddings are cached in the JSON at pipeline time, so enrollment is torch-free and offline.
 - **Project config file** (`transcript-video.toml`): persist per-project flags (model, beam_size, hotwords, tags, speaker map, ...) and switch bundles via `--profile NAME`.
 
 ## Requirements
@@ -28,6 +29,7 @@ This project is the English-language successor of [transcript-italian-video](htt
 - ffmpeg available on `$PATH`
 - For GPU runs: NVIDIA driver + CUDA (≥10 GB VRAM recommended; 16 GB+ for `large-v3`)
 - For diarization: a HuggingFace account with the diarization model's terms accepted, plus an HF token. whisperX's current default is [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1); the older [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) is also supported via `--diarize-model`. **Both are gated repos** — visit the model page once and click "Agree and access repository" before running diarization, otherwise the pipeline aborts with a 403 GatedRepo error.
+- For the speaker-embedding cache (used by `transcript-learn`): the pipeline also fetches [pyannote/wespeaker-voxceleb-resnet34-LM](https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM) when diarization is enabled. The pre-flight check warns if access is missing; if it is, the embedding cache is skipped non-fatally and the rest of the pipeline proceeds.
 
 ## Installation
 
@@ -251,6 +253,51 @@ transcript-to-md video_transcript.json \
   --tag openshift --tag retro
 ```
 
+### Speaker enrollment
+
+Together, `transcript-learn` and `transcript-voices` build a per-user voice-print database from your transcripts. The pipeline caches per-cluster speaker embeddings in the JSON's `speaker_clusters` field (schema version 2) when diarization is enabled; the two binaries below consume that cache. **No audio, no GPU, no model download at learn time.**
+
+The database is a single JSON file (default `~/.local/share/transcript-video/voices.json` — XDG-compliant). It is sync-friendly: back it up, share between machines, version-control it alongside project notes. The location is overridable via `--voice-db PATH` or the `TRANSCRIPT_VIDEO_VOICE_DB` environment variable.
+
+#### `transcript-learn`
+
+Append speakers from a transcript JSON to the database.
+
+```bash
+transcript-learn video_transcript.json \
+  --speaker-map "SPEAKER_00=Mario,SPEAKER_01=Luca"
+```
+
+| Flag | Description |
+|------|-------------|
+| `JSON_PATH` | The `*_transcript.json` produced by `transcript-from-video` (schema version ≥ 2). |
+| `--speaker-map "L0=Name,..."` | Inline label-to-name map. |
+| `--speaker-map-file PATH` | YAML or JSON sidecar (same shape as `transcript-from-video`'s sidecar). |
+| `--voice-db PATH` | Override the default DB location. |
+| `--dry-run` | Print what would be added; don't write the DB. |
+| `-q`, `--quiet` / `-v`, `--verbose` | Output verbosity. |
+
+Labels in `--speaker-map` that don't match any cluster in the JSON (typos, or speakers from a different video) are reported and skipped — they don't fail the operation. Re-running `transcript-learn` on the same speaker across different videos accumulates samples: the more videos the speaker appears in, the more robust their voice print becomes.
+
+#### `transcript-voices`
+
+Inspect and maintain the database.
+
+```bash
+transcript-voices                  # list enrolled speakers (default)
+transcript-voices show Mario       # sample-by-sample detail
+transcript-voices forget Mario     # remove Mario (prompts y/N)
+transcript-voices forget Mario --source ep1_transcript.json --yes
+```
+
+| Sub-command | Description |
+|-------------|-------------|
+| `list` (default when no sub-command) | One line per enrolled speaker, with sample count and embedding model. |
+| `show NAME` | Per-sample detail: source transcript, cluster label, duration, when added. |
+| `forget NAME [--source X] [-y]` | Remove a speaker entirely, or just samples from a given source. Prompts for confirmation unless `-y`/`--yes`. |
+
+All sub-commands accept `--voice-db PATH` to override the default location.
+
 ## Outputs
 
 All outputs default to the input directory with the suffix `_transcript`. With `--basename my_meeting`, files become `my_meeting_transcript.{json,srt,txt,md}`.
@@ -259,7 +306,8 @@ All outputs default to the input directory with the suffix `_transcript`. With `
 
 ```jsonc
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "stage": "complete",
   "source_file": "/abs/path/video.mp4",
   "transcribed_at": "2026-05-05T10:30:00",
   "parameters": {
@@ -283,6 +331,15 @@ All outputs default to the input directory with the suffix `_transcript`. With `
   },
   "audio_info": { "language_detected": "it", "language_probability": 0.98, "duration_seconds": 6135.2 },
   "stats": { "num_segments": 450, "num_speakers": 2, "processing_seconds": 180.3 },
+  "speaker_clusters": {
+    "SPEAKER_00": {
+      "embedding": [0.234, -0.112, "...(256 floats)"],
+      "duration_s": 3611.6,
+      "n_segments": 261,
+      "embedding_model": "pyannote/wespeaker-voxceleb-resnet34-LM"
+    },
+    "SPEAKER_01": { "...": "..." }
+  },
   "segments": [
     {
       "id": 0,
@@ -296,6 +353,8 @@ All outputs default to the input directory with the suffix `_transcript`. With `
   "full_text": "Allora, oggi parliamo...\n..."
 }
 ```
+
+The `speaker_clusters` field is populated only when diarization is enabled and the embedding extraction succeeds; otherwise it's an empty `{}`. It is what `transcript-learn` reads at enrollment time — see [Speaker enrollment](#speaker-enrollment).
 
 ### Markdown
 
