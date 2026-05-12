@@ -7,10 +7,11 @@ pyannote): it works on the JSON file produced by ``transcript-from-video``.
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
-from . import project_config
+from . import project_config, speaker_db
 from .markdown import (
     build_effective_speaker_map,
     load_transcript_json,
@@ -20,6 +21,8 @@ from .markdown import (
 from .speakers import display_name, resolve_speaker_map
 from .stats import compute_speaker_stats
 from .utils import format_timestamp_hms, setup_logging, silence_known_noisy_warnings
+
+logger = logging.getLogger("transcript_video.cli_to_md")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -95,6 +98,34 @@ def _build_parser() -> argparse.ArgumentParser:
             "filling in --speaker-map."
         ),
     )
+
+    identify_group = parser.add_argument_group("Speaker auto-identification (torch-free)")
+    identify_group.add_argument(
+        "--identify-speakers",
+        action="store_true",
+        help=(
+            "Auto-match the JSON's cached cluster embeddings against the voice DB "
+            "and inject the names into speaker_identities at re-render time. "
+            "Requires a schema v2 JSON (cluster embeddings present); no audio, no GPU."
+        ),
+    )
+    identify_group.add_argument(
+        "--voice-db",
+        default=None,
+        help=(
+            "Path to the voice DB used by --identify-speakers. Overrides "
+            "$TRANSCRIPT_VIDEO_VOICE_DB and the XDG default."
+        ),
+    )
+    identify_group.add_argument(
+        "--id-threshold",
+        type=float,
+        default=0.65,
+        help=(
+            "Cosine-similarity threshold for auto-identification (default: 0.65). "
+            "Higher = fewer false positives; lower = more matches."
+        ),
+    )
     parser.add_argument(
         "--mark-suspect",
         action="store_true",
@@ -157,6 +188,79 @@ def _resolve_speaker_stats(transcript: dict) -> dict:
     if isinstance(cached, dict) and cached:
         return cached
     return compute_speaker_stats(transcript.get("segments") or [])
+
+
+def _refresh_auto_identities(
+    transcript: dict, *, voice_db: str | None, threshold: float
+) -> None:
+    """Refresh ``transcript["speaker_identities"]`` from the current DB state.
+
+    Strategy:
+
+    1. Read ``speaker_clusters`` from the JSON; bail out (with a warning) if
+       absent — the user needs a v2 JSON with cached embeddings.
+    2. Load the DB; bail out gracefully if missing / empty / incompatible.
+    3. Run :func:`speaker_db.auto_resolve_speaker_map` against the clusters.
+    4. **Replace** the existing auto entries with the fresh matches; **preserve**
+       manual entries (``source == "manual"``) that were recorded at transcribe
+       time, since the user's explicit assertion shouldn't be undone by today's
+       DB state.
+
+    Torch-free: only ``speaker_db`` is touched; no pyannote/torch import.
+    """
+    clusters = transcript.get("speaker_clusters") or {}
+    if not clusters:
+        logger.warning(
+            "--identify-speakers: this JSON has no cached speaker_clusters. "
+            "Re-process the video with transcript-from-video to populate them."
+        )
+        return
+
+    db_path = speaker_db.resolve_db_path(voice_db)
+    try:
+        db = speaker_db.load_db(db_path)
+    except Exception as e:
+        logger.warning("--identify-speakers: could not load voice DB at %s: %s", db_path, e)
+        return
+
+    if not db.get("speakers"):
+        logger.warning(
+            "--identify-speakers: voice DB at %s is empty. Enroll speakers with "
+            "transcript-learn first.", db_path,
+        )
+        return
+
+    first = next(iter(clusters.values()))
+    cluster_model = first.get("embedding_model") if isinstance(first, dict) else None
+    if cluster_model and not speaker_db.embedding_model_compatible(db, cluster_model):
+        logger.warning(
+            "--identify-speakers: voice DB at %s uses embedding_model %r; "
+            "JSON clusters use %r. Skipping auto-identification.",
+            db_path, db.get("embedding_model"), cluster_model,
+        )
+        return
+
+    auto = speaker_db.auto_resolve_speaker_map(clusters, db, threshold=threshold)
+
+    existing = transcript.get("speaker_identities") or {}
+    refreshed: dict = {}
+    for label, info in auto.items():
+        refreshed[label] = {
+            "name": info["name"],
+            "score": info["score"],
+            "source": "auto",
+        }
+    # Manual entries from transcribe-time survive; they overwrite any fresh auto.
+    for label, entry in existing.items():
+        if isinstance(entry, dict) and entry.get("source") == "manual":
+            refreshed[label] = entry
+
+    transcript["speaker_identities"] = refreshed
+    n_auto = sum(1 for e in refreshed.values() if e.get("source") == "auto")
+    logger.info(
+        "--identify-speakers: %d/%d cluster(s) auto-identified from %s.",
+        n_auto, len(clusters), db_path,
+    )
 
 
 def _format_speaker_overview(transcript: dict, speaker_map: dict[str, str]) -> str:
@@ -223,6 +327,11 @@ def main(argv: list[str] | None = None) -> None:
     speaker_map = resolve_speaker_map(
         args.speaker_map, args.speaker_map_file, fallback=speaker_map_from_config
     )
+
+    if args.identify_speakers:
+        _refresh_auto_identities(
+            transcript, voice_db=args.voice_db, threshold=args.id_threshold,
+        )
 
     if args.list_speakers:
         print(_format_speaker_overview(transcript, speaker_map))
