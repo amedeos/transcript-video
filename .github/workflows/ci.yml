@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, "feature/speaker-identification"]
+    branches: [main]
   pull_request:
-    branches: [main, "feature/speaker-identification"]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
