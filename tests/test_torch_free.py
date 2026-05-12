@@ -40,6 +40,7 @@ PROTECTED_MODULES = (
     "transcript_video.speaker_db",
     "transcript_video.enrollment",
     "transcript_video.cli_learn",
+    "transcript_video.cli_voices",
 )
 
 

@@ -226,3 +226,38 @@ def embedding_model_compatible(db: dict[str, Any], model_id: str) -> bool:
     """True if the DB has no committed model, or its model matches ``model_id``."""
     existing = db.get("embedding_model")
     return existing is None or existing == model_id
+
+
+def all_speaker_names(db: dict[str, Any]) -> list[str]:
+    """Return all speaker names in the DB, sorted alphabetically."""
+    return sorted((db.get("speakers") or {}).keys())
+
+
+def speaker_sample_count(db: dict[str, Any], name: str) -> int:
+    """Return the number of samples enrolled under ``name`` (0 if missing)."""
+    return len((db.get("speakers") or {}).get(name, []))
+
+
+def remove_speaker(db: dict[str, Any], name: str) -> int:
+    """Remove all samples for ``name``. Mutates ``db``. Returns count removed."""
+    speakers = db.setdefault("speakers", {})
+    samples = speakers.pop(name, None)
+    return len(samples) if samples else 0
+
+
+def remove_sample(db: dict[str, Any], name: str, source: str) -> int:
+    """Remove samples for ``name`` whose ``source`` matches. Returns count removed.
+
+    If the last sample for ``name`` is removed, ``name`` is dropped from the DB.
+    """
+    speakers = db.setdefault("speakers", {})
+    samples = speakers.get(name, [])
+    if not samples:
+        return 0
+    remaining = [s for s in samples if s.get("source") != source]
+    removed = len(samples) - len(remaining)
+    if remaining:
+        speakers[name] = remaining
+    else:
+        del speakers[name]
+    return removed
