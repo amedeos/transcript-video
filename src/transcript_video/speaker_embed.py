@@ -29,14 +29,33 @@ DEFAULT_EMBEDDING_MODEL = "pyannote/wespeaker-voxceleb-resnet34-LM"
 DEFAULT_MIN_SEGMENT_SECONDS = 1.5
 
 
+def _build_from_pretrained_kwargs(model_cls, hf_token: str) -> dict[str, Any]:
+    """Pick the token kwarg accepted by ``Model.from_pretrained``.
+
+    pyannote.audio renamed ``use_auth_token`` to ``token`` across releases;
+    introspect and pick whichever the installed version accepts.
+    """
+    try:
+        params = inspect.signature(model_cls.from_pretrained).parameters
+    except (TypeError, ValueError):
+        params = {}
+
+    kwargs: dict[str, Any] = {}
+    for token_arg in ("token", "use_auth_token", "auth_token"):
+        if token_arg in params:
+            kwargs[token_arg] = hf_token
+            break
+    return kwargs
+
+
 def _build_inference_init_kwargs(
-    inference_cls, hf_token: str, device: str, window: str
+    inference_cls, device: str, window: str
 ) -> dict[str, Any]:
     """Build ``Inference.__init__`` kwargs adapting to its signature.
 
-    pyannote.audio renamed ``use_auth_token`` to ``token`` over its history;
-    we accept either by introspection. Same defensive pattern as
-    :func:`diarize._build_pipeline_init_kwargs`.
+    ``Inference`` no longer accepts a token in current pyannote.audio (the
+    token is consumed by ``Model.from_pretrained``); we only forward
+    ``window`` and ``device`` if the signature accepts them.
     """
     try:
         params = inspect.signature(inference_cls.__init__).parameters
@@ -46,10 +65,6 @@ def _build_inference_init_kwargs(
     kwargs: dict[str, Any] = {}
     if "window" in params:
         kwargs["window"] = window
-    for token_arg in ("token", "use_auth_token", "auth_token"):
-        if token_arg in params:
-            kwargs[token_arg] = hf_token
-            break
     if "device" in params:
         kwargs["device"] = device
     return kwargs
@@ -81,8 +96,9 @@ def extract_cluster_embeddings(
     raises if pyannote is not installed or the model is inaccessible.
     """
     import numpy as np
-    from pyannote.audio import Inference
-    from pyannote.core import Segment
+    import torch
+    import whisperx
+    from pyannote.audio import Inference, Model
 
     by_speaker: dict[str, list[tuple[float, float]]] = defaultdict(list)
     for seg in segments:
@@ -100,10 +116,33 @@ def extract_cluster_embeddings(
     logger.info(
         "Loading embedding model '%s' (device=%s)...", model_name, device
     )
-    init_kwargs = _build_inference_init_kwargs(Inference, hf_token, device, window="whole")
-    inference = Inference(model_name, **init_kwargs)
+    # Current pyannote.audio requires a pre-loaded Model; passing the bare
+    # model_name to Inference fails with `'str' object has no attribute 'eval'`.
+    pretrained_kwargs = _build_from_pretrained_kwargs(Model, hf_token)
+    model = Model.from_pretrained(model_name, **pretrained_kwargs)
+    # pyannote.audio's Inference stores `self.device` as-is; some of its
+    # internals (e.g. fix_reproducibility) then access `device.type`, which
+    # raises AttributeError if we passed a bare string. Convert up front.
+    torch_device = torch.device(device) if isinstance(device, str) else device
+    init_kwargs = _build_inference_init_kwargs(Inference, torch_device, window="whole")
+    inference = Inference(model, **init_kwargs)
 
+    # Load the audio via whisperx — the loader the rest of the pipeline uses
+    # for ASR/diarization. ffmpeg-based via subprocess, robust across formats
+    # and not subject to the torchaudio backend churn that has produced
+    # segfaults in some pyannote.audio builds when passing audio in directly.
+    # Always returns mono float32 at 16 kHz, which is what wespeaker expects.
     audio_path = str(audio_path)
+    audio_array = whisperx.load_audio(audio_path)
+    waveform = torch.from_numpy(audio_array).unsqueeze(0)  # shape (1, n_samples)
+    sample_rate = 16000
+
+    # Inference is fed each segment as a ProtocolFile dict ({"waveform",
+    # "sample_rate"}); passing a path string to Inference.crop (the documented
+    # short form) hits `'str' object has no attribute 'type'` in some
+    # pyannote.audio builds. The dict-based path bypasses that code entirely.
+    min_chunk_samples = int(0.1 * sample_rate)  # require ≥100ms of audio
+
     result: dict[str, dict[str, Any]] = {}
 
     for speaker, spans in by_speaker.items():
@@ -112,12 +151,18 @@ def extract_cluster_embeddings(
 
         per_segment: list[Any] = []
         for start, end in chosen:
+            start_sample = int(start * sample_rate)
+            end_sample = int(end * sample_rate)
+            chunk = waveform[:, start_sample:end_sample].contiguous()
+            if chunk.shape[1] < min_chunk_samples:
+                continue
             try:
-                emb = inference.crop(audio_path, Segment(start, end))
+                emb = inference({"waveform": chunk, "sample_rate": sample_rate})
             except Exception as e:
                 logger.warning(
                     "Failed to embed segment %.2f-%.2f for %s: %s",
                     start, end, speaker, e,
+                    exc_info=True,
                 )
                 continue
             per_segment.append(np.asarray(emb).reshape(-1))
