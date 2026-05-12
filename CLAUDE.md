@@ -72,18 +72,27 @@ These are non-obvious from the code and **must hold across any refactor**.
 
 ### 1. The torch-free re-render path
 
-`transcript-to-md` exists so users can re-render Markdown from a saved JSON without a GPU or model download. The protected set (enforced by `tests/test_torch_free.py`):
+`transcript-to-md`, `transcript-learn`, and `transcript-voices` all exist so users can do post-processing work — re-render Markdown, enroll speakers into the DB, manage the DB — without a GPU or model download. The protected set (enforced by `tests/test_torch_free.py`):
 
 - `utils.py`, `speakers.py`, `stats.py`, `markdown.py`, `writers.py`, `project_config.py`, `cli_to_md.py`
+- `speaker_db.py`, `enrollment.py`, `cli_learn.py`, `cli_voices.py`
 - Allowed deps: stdlib + PyYAML + `tomli`/`tomllib`
 
-Do **not** add imports from `asr`, `diarize`, `pipeline`, `preflight`, `whisperx`, `torch`, `pyannote`, `transformers`, `ctranslate2`, or `faster_whisper` to those modules. If you need a helper from there, lift it into `utils.py` / `stats.py` instead.
+Do **not** add imports from `asr`, `diarize`, `pipeline`, `preflight`, `speaker_embed`, `whisperx`, `torch`, `pyannote`, `transformers`, `ctranslate2`, `faster_whisper`, or `numpy` to those modules. If you need a helper from there, lift it into `utils.py` / `stats.py` / `speaker_db.py` instead.
 
-### 2. JSON is the contract between the two binaries
+The auto-identification refresh in `cli_to_md.py --identify-speakers` is part of this set: cosine matching runs in pure Python (no numpy) against the JSON's cached `speaker_clusters`. See invariant #9.
 
-The shape produced by `pipeline.py` is the input to `markdown.py`. Adding/renaming a field in one place requires the other. Bump `schema_version` in `pipeline.py` if you change the shape; have `markdown.py` tolerate older versions or fail with a clear message.
+### 2. JSON is the contract across all four binaries
 
-Top-level keys: `schema_version`, `source_file`, `transcribed_at`, `parameters`, `audio_info`, `stats`, `segments`, `full_text`. All field names are English (this is the explicit rename vs. the reference project, which used Italian field names like `file_sorgente`, `parametri`, `segmenti`).
+The shape produced by `pipeline.py` is the input to `markdown.py`, `enrollment.py`, and the auto-id path in `cli_to_md.py`. Adding/renaming a field in one place requires the others. Bump `schema_version` in `pipeline.py` when you change the shape; have consumers tolerate older versions or fail with a clear message.
+
+Top-level keys at the current schema version (`2`):
+
+- `schema_version`, `stage`, `source_file`, `transcribed_at`, `parameters`, `audio_info`, `stats`, `segments`, `full_text`
+- `speaker_clusters` (since v2): per-cluster cached embeddings — empty when diarization is off or extraction failed.
+- `speaker_identities` (since v2): per-cluster `{name, score, source}` — populated only when `--identify-speakers` is on, at pipeline time or re-render time.
+
+All field names are English (the explicit rename vs. the reference project, which used Italian field names like `file_sorgente`, `parametri`, `segmenti`).
 
 ### 3. Output policy is the reverse of the reference project
 
@@ -117,11 +126,31 @@ Both share the same schema. The top-level `stage` field discriminates them (`"al
 
 `[speaker_map]` is special-cased: it's not a CLI flag (the CLI uses `--speaker-map` / `--speaker-map-file`), so we extract it separately and pass it as `fallback` to `resolve_speaker_map`. When refactoring this, keep the precedence: `--speaker-map` > `--speaker-map-file` > config `[speaker_map]` > `{}`.
 
-### 8. Suspect thresholds are policy, not data
+### 8. Speaker identification: CLI map > manual identities > auto identities
+
+The `speaker_identities` field in the JSON (schema v2) is a *hint* about who each `SPEAKER_XX` cluster is, populated by `--identify-speakers` at transcribe time and/or re-render time. Each entry carries a `source` discriminator:
+
+- `source: "auto"` — DB match above threshold. **Refresh-able**: `transcript-to-md --identify-speakers` overwrites these with the current DB state. Stale auto entries should never block fresh matches.
+- `source: "manual"` — user assertion via `--speaker-map` at transcribe time. **Preserved on refresh**: a re-render auto-id pass leaves these alone. The user's intent at transcribe time is not undone by today's DB state.
+
+Rendering — `markdown.py` and `cli_to_md._format_speaker_overview` — builds an effective map via `markdown.build_effective_speaker_map(transcript, cli_speaker_map)`. The precedence (highest to lowest):
+
+1. CLI `--speaker-map` / `--speaker-map-file` at render time
+2. `speaker_identities[label]` with `source="manual"`
+3. `speaker_identities[label]` with `source="auto"`
+4. The raw `SPEAKER_XX` label
+
+Below-threshold clusters get **no entry** in `speaker_identities` — they keep their raw label and are visible as unidentified. Never silently mislabel.
+
+The whole identification path (`speaker_db.auto_resolve_speaker_map`, `_refresh_auto_identities` in `cli_to_md`, `_resolve_speaker_identities` in `pipeline`, `build_effective_speaker_map` in `markdown`) is torch-free at the consumer side. Only `pipeline._resolve_speaker_identities` runs in the heavy path because the pipeline already has torch loaded; the same logic is replayed at re-render time with no torch import.
+
+### 9. Suspect thresholds are policy, not data
 
 `stats.DEFAULT_AVG_LOGPROB_THRESHOLD = -1.0` and `DEFAULT_NO_SPEECH_PROB_THRESHOLD = 0.6` are tuning constants for whisperX large-v3. They are persisted in `parameters.suspect_thresholds` so a downstream consumer can tell *which* thresholds produced the flags. Don't change the defaults silently — bump `schema_version` if the new defaults would meaningfully reshuffle the suspect set on existing JSONs.
 
 `mark_suspect_segments` mutates segments in place. Calling it on segments that were already flagged is idempotent (the existing `suspect: true` is overwritten with the same value); but if you change thresholds between calls, the previous flags are NOT cleared first. If that ever matters, normalize at the start of the function.
+
+The auto-id default threshold `speaker_db.DEFAULT_THRESHOLD = 0.65` is the same kind of policy constant. Surfaced through `--id-threshold` on both binaries so users can tune for their cohort. The plan was: prefer false-negative (no match) over false-positive (wrong speaker). Adjust the default with the same caution as the suspect thresholds.
 
 ## Reference-project parity
 
@@ -136,7 +165,7 @@ If you find yourself "improving" any of these, double-check the upstream behavio
 
 ## CLI design rules
 
-- Two binaries, not one with subcommands: `transcript-from-video` (full pipeline) and `transcript-to-md` (pure re-render). They are wired in `pyproject.toml` under `[project.scripts]`.
+- **Four binaries, not one with subcommands**: `transcript-from-video` (full pipeline), `transcript-to-md` (torch-free re-render), `transcript-learn` (torch-free DB enrollment), `transcript-voices` (torch-free DB introspection/cleanup). All wired in `pyproject.toml` under `[project.scripts]`. The three torch-free ones extend invariant #1.
 - Mutex groups for `--prompt*` and `--hotwords*` because the three modes (inline / file / explicit-disable) are exclusive by design.
 - Frontmatter overrides (`--date`, `--tag`, `--source`) live on **both** binaries so re-rendering can correct or extend metadata after the fact.
 - `--merge-gap-seconds 0` means "never merge consecutive same-speaker segments". The check in `markdown._group_segments` is `merge_gap_seconds > 0` *then* `gap <= merge_gap_seconds` — keep that ordering.
