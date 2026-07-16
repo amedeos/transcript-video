@@ -26,9 +26,9 @@ from . import speaker_db as speaker_db_mod
 from . import speaker_embed as speaker_embed_mod
 from . import stats as stats_mod
 from .config import RunConfig
-from .markdown import render_markdown, write_markdown
+from .markdown import build_effective_speaker_map, render_markdown, write_markdown
 from .utils import format_timestamp_short
-from .writers import write_json, write_srt, write_txt
+from .writers import write_json, write_srt, write_txt, write_vtt
 
 logger = logging.getLogger("transcript_video.pipeline")
 
@@ -52,6 +52,7 @@ def _resolve_output_paths(config: RunConfig) -> dict[str, Path]:
         "json": output_dir / f"{basename}_{suffix}.json",
         "aligned": output_dir / f"{basename}_{suffix}.aligned.json",
         "srt": output_dir / f"{basename}_{suffix}.srt",
+        "vtt": output_dir / f"{basename}_{suffix}.vtt",
         "txt": output_dir / f"{basename}_{suffix}.txt",
         "md": output_dir / f"{basename}_{suffix}.md",
     }
@@ -410,12 +411,22 @@ def _write_outputs(payload: dict[str, Any], config: RunConfig, paths: dict[str, 
     written: dict[str, Path] = {}
     segments = payload.get("segments", [])
 
+    # Effective {label: name} map for subtitle cues, only when requested.
+    speaker_names = (
+        build_effective_speaker_map(payload, config.speaker_map)
+        if config.output.subtitle_speakers
+        else None
+    )
+
     if config.output.write_json:
         write_json(payload, paths["json"])
         written["json"] = paths["json"]
     if config.output.write_srt:
-        write_srt(segments, paths["srt"])
+        write_srt(segments, paths["srt"], speaker_names=speaker_names)
         written["srt"] = paths["srt"]
+    if config.output.write_vtt:
+        write_vtt(segments, paths["vtt"], speaker_names=speaker_names)
+        written["vtt"] = paths["vtt"]
     if config.output.write_txt:
         write_txt(segments, paths["txt"])
         written["txt"] = paths["txt"]

@@ -20,8 +20,10 @@ class DiarizationConfig:
 class OutputConfig:
     write_json: bool = True
     write_srt: bool = False
+    write_vtt: bool = False
     write_txt: bool = False
     write_md: bool = False
+    subtitle_speakers: bool = False
     output_dir: Path | None = None
     basename: str | None = None
 
