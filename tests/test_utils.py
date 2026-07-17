@@ -10,6 +10,7 @@ from transcript_video.utils import (
     format_timestamp_hms,
     format_timestamp_short,
     format_timestamp_srt,
+    format_timestamp_vtt,
     read_text_file,
     silence_known_noisy_warnings,
 )
@@ -37,6 +38,30 @@ class TestFormatTimestampSrt:
     def test_millis_rollover(self):
         # 0.9999s rounds to 1000 ms, which must roll into the next second.
         assert format_timestamp_srt(0.9999) == "00:00:01,000"
+
+
+class TestFormatTimestampVtt:
+    @pytest.mark.parametrize(
+        "seconds,expected",
+        [
+            (0.0, "00:00:00.000"),
+            (0.5, "00:00:00.500"),
+            (1.0, "00:00:01.000"),
+            (60.0, "00:01:00.000"),
+            (3600.0, "01:00:00.000"),
+            (3661.123, "01:01:01.123"),
+        ],
+    )
+    def test_typical(self, seconds, expected):
+        # WebVTT uses a dot (not SRT's comma) for the millisecond separator.
+        assert format_timestamp_vtt(seconds) == expected
+
+    def test_negative_clamps_to_zero(self):
+        assert format_timestamp_vtt(-1.0) == "00:00:00.000"
+
+    def test_millis_rollover(self):
+        # 0.9999s rounds to 1000 ms, which must roll into the next second.
+        assert format_timestamp_vtt(0.9999) == "00:00:01.000"
 
 
 class TestFormatTimestampHms:

@@ -22,6 +22,24 @@ def format_timestamp_srt(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
+def format_timestamp_vtt(seconds: float) -> str:
+    """Convert seconds to ``HH:MM:SS.mmm`` (WebVTT spec).
+
+    Identical to :func:`format_timestamp_srt` except WebVTT uses a dot as the
+    decimal separator for milliseconds instead of SRT's comma.
+    """
+    if seconds < 0:
+        seconds = 0.0
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int(round((seconds - int(seconds)) * 1000))
+    if millis == 1000:
+        millis = 0
+        secs += 1
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
 def format_timestamp_hms(seconds: float) -> str:
     """Convert seconds to ``HH:MM:SS`` (used in Markdown headings and frontmatter ``duration``)."""
     if seconds < 0:

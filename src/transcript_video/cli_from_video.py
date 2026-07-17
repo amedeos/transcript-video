@@ -206,8 +206,14 @@ Examples:
 
     out_group = parser.add_argument_group("Outputs")
     out_group.add_argument("--srt", action="store_true", help="Write a SubRip subtitle file.")
+    out_group.add_argument("--vtt", action="store_true", help="Write a WebVTT subtitle file.")
     out_group.add_argument("--txt", action="store_true", help="Write a plain-text transcript file.")
     out_group.add_argument("--md", action="store_true", help="Write a human-readable Markdown transcript.")
+    out_group.add_argument(
+        "--subtitle-speakers",
+        action="store_true",
+        help="Prefix each subtitle cue with the speaker name (applies to --srt and --vtt).",
+    )
     out_group.add_argument(
         "--output-dir",
         default=None,
@@ -391,8 +397,10 @@ def main(argv: list[str] | None = None) -> None:
         output=OutputConfig(
             write_json=True,
             write_srt=args.srt,
+            write_vtt=args.vtt,
             write_txt=args.txt,
             write_md=args.md,
+            subtitle_speakers=args.subtitle_speakers,
             output_dir=Path(args.output_dir) if args.output_dir else None,
             basename=args.basename,
         ),

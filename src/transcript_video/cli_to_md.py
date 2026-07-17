@@ -21,6 +21,7 @@ from .markdown import (
 from .speakers import display_name, resolve_speaker_map
 from .stats import compute_speaker_stats
 from .utils import format_timestamp_hms, setup_logging, silence_known_noisy_warnings
+from .writers import write_srt, write_vtt
 
 logger = logging.getLogger("transcript_video.cli_to_md")
 
@@ -125,6 +126,25 @@ def _build_parser() -> argparse.ArgumentParser:
             "Cosine-similarity threshold for auto-identification (default: 0.65). "
             "Higher = fewer false positives; lower = more matches."
         ),
+    )
+    subtitle_group = parser.add_argument_group("Subtitle outputs (torch-free)")
+    subtitle_group.add_argument(
+        "--srt",
+        action="store_true",
+        help=(
+            "Also write a SubRip (.srt) subtitle file next to the JSON. "
+            "Readable by VLC and most desktop players; no GPU needed."
+        ),
+    )
+    subtitle_group.add_argument(
+        "--vtt",
+        action="store_true",
+        help="Also write a WebVTT (.vtt) subtitle file next to the JSON.",
+    )
+    subtitle_group.add_argument(
+        "--subtitle-speakers",
+        action="store_true",
+        help="Prefix each subtitle cue with the speaker name (applies to --srt and --vtt).",
     )
     parser.add_argument(
         "--mark-suspect",
@@ -336,6 +356,22 @@ def main(argv: list[str] | None = None) -> None:
     if args.list_speakers:
         print(_format_speaker_overview(transcript, speaker_map))
         return
+
+    if args.srt or args.vtt:
+        speaker_names = (
+            build_effective_speaker_map(transcript, speaker_map)
+            if args.subtitle_speakers
+            else None
+        )
+        segments = transcript.get("segments") or []
+        if args.srt:
+            srt_path = json_path.with_suffix(".srt")
+            write_srt(segments, srt_path, speaker_names=speaker_names)
+            print(f"SubRip written: {srt_path}")
+        if args.vtt:
+            vtt_path = json_path.with_suffix(".vtt")
+            write_vtt(segments, vtt_path, speaker_names=speaker_names)
+            print(f"WebVTT written: {vtt_path}")
 
     md = render_markdown(
         transcript,

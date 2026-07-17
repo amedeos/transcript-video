@@ -207,11 +207,15 @@ See [Project config file](#project-config-file) for the full schema.
 
 | Flag | Description |
 |------|-------------|
-| `--srt` | Write SubRip subtitles |
+| `--srt` | Write SubRip (`.srt`) subtitles |
+| `--vtt` | Write WebVTT (`.vtt`) subtitles |
 | `--txt` | Write plain text |
 | `--md` | Write Markdown with frontmatter |
+| `--subtitle-speakers` | Prefix each subtitle cue with the speaker name (applies to `--srt` and `--vtt`). Uses the effective speaker map: CLI `--speaker-map` > manual identities > auto identities > raw `SPEAKER_XX`. |
 | `--output-dir DIR` | Output directory (default: alongside the input) |
 | `--basename NAME` | Filename stem (default: stem of the input) |
+
+Both `.srt` and `.vtt` are read natively by VLC, mpv and most desktop players: give the subtitle file the same base name as the video in the same folder, or load it from *Subtitles → Add subtitle file*. `.vtt` is also the format HTML5 `<track>` expects for web video.
 
 **Markdown frontmatter** (only used with `--md`)
 
@@ -236,6 +240,8 @@ transcript-to-md PATH/TO/foo_transcript.json \
 | Flag | Description |
 |------|-------------|
 | `-o`, `--output PATH` | Output path (default: `<stem>.md` next to the JSON) |
+| `--srt` / `--vtt` | Also write a `.srt` / `.vtt` subtitle file next to the JSON — torch-free, no GPU. Regenerate player-ready subtitles from an existing transcript. |
+| `--subtitle-speakers` | Prefix each subtitle cue with the speaker name (applies to `--srt` and `--vtt`); same precedence as on `transcript-from-video`. |
 | `--speaker-map "..."` / `--speaker-map-file PATH` | Same as `transcript-from-video` |
 | `--date`, `--tag`, `--source` | Frontmatter overrides |
 | `--merge-gap-seconds FLOAT` | Merge consecutive same-speaker segments whose silent gap is at most this many seconds (default `1.5`; `0` disables merging) |
@@ -343,7 +349,7 @@ All sub-commands accept `--voice-db PATH` to override the default location.
 
 ## Outputs
 
-All outputs default to the input directory with the suffix `_transcript`. With `--basename my_meeting`, files become `my_meeting_transcript.{json,srt,txt,md}`.
+All outputs default to the input directory with the suffix `_transcript`. With `--basename my_meeting`, files become `my_meeting_transcript.{json,srt,vtt,txt,md}`.
 
 ### JSON (canonical artifact)
 
