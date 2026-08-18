@@ -59,6 +59,43 @@ def format_timestamp_short(seconds: float) -> str:
     return f"[{minutes:02d}:{secs:02d}]"
 
 
+class _LightningUpgradeFilter(logging.Filter):
+    """Drop Lightning's "automatically upgraded your loaded checkpoint" log records.
+
+    whisperX ships a VAD checkpoint saved with Lightning v1.5.4; Lightning ≥2.x
+    emits an INFO record on every load offering the one-shot upgrade command.
+    The record is emitted via ``logging`` (logger
+    ``lightning.pytorch.utilities.migration.utils``), not via ``warnings.warn``,
+    so the ``warnings.filterwarnings`` calls in this module never touched it.
+
+    Two complementary remedies exist and both ship together:
+
+    - **Runtime filter (this class)**: durable across reinstalls and portable
+      to fresh installs. Always active after :func:`silence_known_noisy_warnings`.
+    - **One-shot checkpoint upgrade**: ``python -m
+      lightning.pytorch.utilities.upgrade_checkpoint --map-to-cpu
+      <site-packages>/whisperx/assets/pytorch_model.bin`` rewrites the file in
+      place so Lightning stops emitting the record. Lost on every
+      ``uv sync`` / whisperX reinstall and CPU-only hosts need ``--map-to-cpu``
+      (the checkpoint stores CUDA tensors). Not reproducible across machines,
+      so the runtime filter remains the real guarantee.
+    """
+
+    _MARKER = "Lightning automatically upgraded your loaded checkpoint"
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Return False to drop the record. Written as `not in` (ruff E713)
+        # so a future marker change only touches one string.
+        return self._MARKER not in record.getMessage()
+
+
+_LIGHTNING_UPGRADE_LOGGERS = (
+    "lightning.pytorch.utilities.migration.utils",
+    # Legacy name kept for installs that still re-export from pytorch_lightning.
+    "pytorch_lightning.utilities.migration.utils",
+)
+
+
 def silence_known_noisy_warnings() -> None:
     """Hide third-party warnings that are not actionable for this tool.
 
@@ -72,10 +109,14 @@ def silence_known_noisy_warnings() -> None:
       paragraph that confuses users every run.
     - **TF32 disabled**: pyannote turns off TensorFloat-32 for reproducibility.
       Informational; no quality impact for transcription/diarization.
-
-    Lightning's checkpoint-upgrade *print* (not a warning) is left visible
-    because it can't be suppressed without redirecting stderr globally and
-    isn't actually noisy enough to justify that.
+    - **Lightning checkpoint-upgrade notice**: Lightning ≥2.x prints a
+      "automatically upgraded your loaded checkpoint" message on every load
+      of the whisperX VAD checkpoint (saved with Lightning v1.5.4). It's an
+      INFO log record, not a warning, so it bypasses
+      ``warnings.filterwarnings``. Suppressed here via a
+      :class:`logging.Filter` on the emitting logger. See
+      :class:`_LightningUpgradeFilter` for why the one-shot file upgrade is
+      kept as a secondary, non-durable remedy.
     """
     # Both pyannote warnings are multi-line and start with a leading newline
     # (they're built from triple-quoted f-strings), so the regex needs the
@@ -89,6 +130,19 @@ def silence_known_noisy_warnings() -> None:
         "ignore",
         message=r"(?s).*TensorFloat-32.*has been disabled.*",
     )
+
+    # Lightning upgrade notice: attach the filter idempotently. The filter
+    # object must be the same instance to detect re-registration —
+    # `logging.Filter.__eq__` is identity, so a fresh `_LightningUpgradeFilter()`
+    # on every call would silently stack N copies and break the idempotency
+    # contract documented in the test suite. Cache it on the function.
+    if not hasattr(silence_known_noisy_warnings, "_lightning_filter"):
+        silence_known_noisy_warnings._lightning_filter = _LightningUpgradeFilter()  # type: ignore[attr-defined]
+    filt = silence_known_noisy_warnings._lightning_filter  # type: ignore[attr-defined]
+    for logger_name in _LIGHTNING_UPGRADE_LOGGERS:
+        logger = logging.getLogger(logger_name)
+        if filt not in logger.filters:
+            logger.addFilter(filt)
 
 
 def setup_logging(*, quiet: bool = False, verbose: bool = False) -> None:

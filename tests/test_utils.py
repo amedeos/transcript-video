@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import warnings
 
 import pytest
@@ -109,6 +110,14 @@ class TestSilenceKnownNoisyWarnings:
         "reproducibility issues and lower accuracy.\nIt can be re-enabled "
         "by calling\n   >>> import torch"
     )
+    # Lightning emits this exact prefix from
+    # `lightning.pytorch.utilities.migration.utils._pl_migrate_checkpoint`
+    # via `logging.info`, not `warnings.warn`. The runtime filter must drop it.
+    REAL_LIGHTNING_MESSAGE = (
+        "Lightning automatically upgraded your loaded checkpoint from v1.5.4 "
+        "to v2.6.1. To apply the upgrade to your files permanently, run "
+        "`python -m lightning.pytorch.utilities.upgrade_checkpoint ...`"
+    )
 
     def test_torchcodec_warning_silenced(self):
         with warnings.catch_warnings(record=True) as captured:
@@ -131,6 +140,96 @@ class TestSilenceKnownNoisyWarnings:
             silence_known_noisy_warnings()
             warnings.warn("something else entirely", UserWarning, stacklevel=2)
             assert any("something else" in str(w.message) for w in captured)
+
+    @pytest.fixture
+    def lightning_logger_clean(self):
+        """Restore the Lightning migration logger to its pre-test filter state.
+
+        The runtime filter is global and durable by design: once attached it
+        stays attached for the process lifetime, so subsequent runs (real CLI
+        invocations) don't re-emit the notice. Tests that assert filter
+        behavior must clean up so they don't leak state into sibling tests or
+        the unrelated-warnings test.
+
+        The logger level is forced to DEBUG here because the real CLI calls
+        ``setup_logging()`` which lowers the root to INFO, but pytest does not,
+        so INFO records would be dropped by the logger-level gate before the
+        filter is even consulted — masking the behavior under test.
+        """
+        logger_name = "lightning.pytorch.utilities.migration.utils"
+        logger = logging.getLogger(logger_name)
+        original_filters = list(logger.filters)
+        original_level = logger.level
+        original_propagate = logger.propagate
+        logger.setLevel(logging.DEBUG)
+        yield logger
+        logger.filters = original_filters
+        logger.level = original_level
+        logger.propagate = original_propagate
+
+    def test_lightning_upgrade_message_silenced(self, lightning_logger_clean):
+        # The filter drops the record before it reaches handlers, so a
+        # capturing handler on the emitting logger sees nothing.
+        logger = lightning_logger_clean
+        silence_known_noisy_warnings()
+        records: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        # Reset filters on the logger to baseline so only the silence filter
+        # (added by silence_known_noisy_warnings) is present; the capture
+        # handler must still see through if the filter lets records pass.
+        capture = _Capture(level=logging.DEBUG)
+        logger.addHandler(capture)
+        try:
+            logger.info(self.REAL_LIGHTNING_MESSAGE)
+        finally:
+            logger.removeHandler(capture)
+        assert not records, (
+            "Lightning upgrade notice was not silenced — filter did not drop it"
+        )
+
+    def test_lightning_other_messages_pass_through(self, lightning_logger_clean):
+        # Sanity: the filter is specific to the upgrade marker, not a blanket
+        # mute on the whole logger. Other info records from the same module
+        # must still propagate to handlers.
+        logger = lightning_logger_clean
+        silence_known_noisy_warnings()
+        records: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        capture = _Capture(level=logging.DEBUG)
+        logger.addHandler(capture)
+        try:
+            logger.info("some other lightning message")
+        finally:
+            logger.removeHandler(capture)
+        assert any(
+            "some other lightning message" in r.getMessage() for r in records
+        ), "Filter is too broad — it muted an unrelated Lightning record"
+
+    def test_lightning_filter_idempotent(self, lightning_logger_clean):
+        # Calling silence_known_noisy_warnings() repeatedly must not stack
+        # duplicate filter instances on the logger. Otherwise each call adds
+        # another copy and the idempotency contract documented in utils.py
+        # is violated (no functional difference, but a leak across re-imports
+        # / repeated CLI invocations in the same process).
+        logger = lightning_logger_clean
+        silence_known_noisy_warnings()
+        silence_known_noisy_warnings()
+        silence_known_noisy_warnings()
+        # The cached filter instance is the one attached; count occurrences.
+        filt = silence_known_noisy_warnings._lightning_filter  # type: ignore[attr-defined]
+        count = sum(1 for f in logger.filters if f is filt)
+        assert count == 1, (
+            f"Expected exactly 1 attached filter instance, found {count} — "
+            "silence_known_noisy_warnings is not idempotent"
+        )
 
 
 class TestReadTextFile:
