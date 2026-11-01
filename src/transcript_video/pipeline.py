@@ -14,8 +14,10 @@ The ``stage`` field at the top level discriminates the two payloads.
 
 from __future__ import annotations
 
+import gc
 import logging
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -176,21 +178,89 @@ def _build_payload(
     }
 
 
-def _run_asr_and_align(config: RunConfig, *, paths: dict[str, Path]) -> dict[str, Any]:
+@dataclass(frozen=True)
+class _Devices:
+    """Devices for one run, resolved once so the stages can't disagree.
+
+    ``asr`` / ``compute_type`` are ``None`` when resuming (no ASR runs).
+    """
+
+    asr: str | None
+    compute_type: str | None
+    torch: str
+
+
+def _resolve_devices(config: RunConfig) -> _Devices:
+    """Resolve the ASR (ctranslate2) and torch devices, before any heavy work.
+
+    Each library gets the GPU when *it* can use one. With ``--device auto`` a
+    library without CUDA runs on CPU. With an explicit ``--device cuda``,
+    either library lacking CUDA stops the run here (see
+    :func:`asr.resolve_device`), in seconds instead of after hours on CPU.
+    """
+    asr_device = compute_type = None
+    if not config.resume_from_aligned:
+        asr_device, compute_type = asr_mod.resolve_device_and_compute(
+            config.device, config.compute_type
+        )
+    torch_device = asr_mod.resolve_device(config.device, asr_mod.BACKEND_TORCH)
+    if asr_device is not None and asr_device != torch_device:
+        logger.warning(
+            "Mixed devices: ASR on %s, alignment/diarization on %s "
+            "(only one of ctranslate2 / torch can use CUDA on this machine).",
+            asr_device,
+            torch_device,
+        )
+    return _Devices(asr=asr_device, compute_type=compute_type, torch=torch_device)
+
+
+def _configure_threads(config: RunConfig, devices: _Devices) -> int | None:
+    """Apply the CPU thread policy; return the thread count for ctranslate2 (or ``None``).
+
+    An explicit ``--threads`` applies everywhere. Otherwise the default
+    (CPUs - 1) is applied only to the libraries running on CPU. A library on
+    the GPU keeps its own default; torch, for instance, defaults to the
+    physical core count.
+    """
+    explicit = config.threads is not None
+    threads = asr_mod.resolve_cpu_threads(config.threads)
+    asr_threads = threads if explicit or devices.asr == "cpu" else None
+    torch_threads = threads if explicit or devices.torch == "cpu" else None
+    if torch_threads is not None:
+        asr_mod.apply_torch_threads(torch_threads)
+    if asr_threads is None and torch_threads is None:
+        logger.info("CPU threads: library defaults (GPU run; --threads N to override).")
+    else:
+        logger.info("CPU threads: %d", threads)
+    return asr_threads
+
+
+def _run_asr_and_align(
+    config: RunConfig,
+    *,
+    paths: dict[str, Path],
+    devices: _Devices,
+    threads: int | None = None,
+) -> dict[str, Any]:
     """Run model load → ASR → alignment, returning the aligned-stage payload.
+
+    ASR runs on ``devices.asr`` (ctranslate2) and alignment on
+    ``devices.torch``. Both were resolved once by :func:`_resolve_devices`.
 
     Side effect: when diarization is enabled, persists the aligned payload to
     ``paths['aligned']`` so a downstream failure doesn't lose the work.
     """
     input_path = config.input_file.resolve()
-    device, compute_type = asr_mod.resolve_device_and_compute(config.device, config.compute_type)
+    device, compute_type = devices.asr, devices.compute_type
     if device == "cuda":
         logger.info("Using CUDA acceleration (compute_type=%s).", compute_type)
     else:
-        logger.warning("Running on CPU (slower).")
+        logger.warning("Running on CPU (compute_type=%s, slower).", compute_type)
 
     logger.info("Loading whisperX model '%s'...", config.model)
-    model = asr_mod.load_whisperx_model(config.model, device, compute_type, config.beam_size)
+    model = asr_mod.load_whisperx_model(
+        config.model, device, compute_type, config.beam_size, threads=threads
+    )
 
     transcribe_kwargs = asr_mod.build_transcribe_kwargs(
         language=config.language,
@@ -217,6 +287,10 @@ def _run_asr_and_align(config: RunConfig, *, paths: dict[str, Path]) -> dict[str
 
     start_time = datetime.now()
     asr_result = model.transcribe(audio, batch_size=16, **transcribe_kwargs)
+    # Free the ASR model before alignment/diarization load their own models:
+    # large-v3 in float32 on CPU holds several GB of RAM.
+    del model
+    gc.collect()
 
     detected_language = asr_result.get("language") or config.language or "und"
     raw_segments: list[dict[str, Any]] = list(asr_result.get("segments", []))
@@ -226,7 +300,7 @@ def _run_asr_and_align(config: RunConfig, *, paths: dict[str, Path]) -> dict[str
         logger.debug("%s %s", format_timestamp_short(float(seg.get("start") or 0.0)), text)
 
     logger.info("Aligning to word level...")
-    aligned = asr_mod.align_segments(raw_segments, detected_language, audio, device)
+    aligned = asr_mod.align_segments(raw_segments, detected_language, audio, devices.torch)
     aligned_segments = [_normalize_segment(s) for s in aligned.get("segments", [])]
     align_time = datetime.now()
     align_seconds = (align_time - start_time).total_seconds()
@@ -272,10 +346,17 @@ def _load_aligned_payload(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _diarize_payload(payload: dict[str, Any], config: RunConfig) -> dict[str, Any]:
-    """Run diarization on an aligned payload and return the complete payload."""
+def _diarize_payload(payload: dict[str, Any], config: RunConfig, *, device: str) -> dict[str, Any]:
+    """Run diarization on an aligned payload and return the complete payload.
+
+    Diarization and embeddings run on ``device``: the torch device resolved
+    for *this* run, never the snapshot's. So an aligned snapshot made on a GPU
+    machine can be resumed on a CPU-only one, and vice versa.
+    ``parameters.device`` in the JSON keeps the device the ASR ran on (read
+    from the payload), so it stays consistent with ``compute_type``.
+    """
     input_path = config.input_file.resolve()
-    device = payload["parameters"].get("device") or "cpu"
+    asr_device = payload["parameters"].get("device") or "cpu"
 
     logger.info("Running speaker diarization (pyannote)...")
     audio = asr_mod.load_audio(input_path)
@@ -326,7 +407,7 @@ def _diarize_payload(payload: dict[str, Any], config: RunConfig) -> dict[str, An
         source_file=input_path,
         transcribed_at=datetime.now(),
         config=config,
-        device=device,
+        device=asr_device,
         compute_type=payload["parameters"].get("compute_type") or "",
         detected_language=payload["audio_info"].get("language_detected") or "und",
         language_probability=payload["audio_info"].get("language_probability"),
@@ -463,15 +544,20 @@ def run_pipeline(config: RunConfig) -> dict[str, Path]:
 
     paths = _resolve_output_paths(config)
 
+    devices = _resolve_devices(config)
+    asr_threads = _configure_threads(config, devices)
+
     if config.resume_from_aligned:
         logger.info("Resuming from aligned snapshot: %s", config.resume_from_aligned)
         aligned_payload = _load_aligned_payload(config.resume_from_aligned)
     else:
-        aligned_payload = _run_asr_and_align(config, paths=paths)
+        aligned_payload = _run_asr_and_align(
+            config, paths=paths, devices=devices, threads=asr_threads
+        )
 
     if config.diarization.enabled:
         try:
-            final_payload = _diarize_payload(aligned_payload, config)
+            final_payload = _diarize_payload(aligned_payload, config, device=devices.torch)
         except SystemExit:
             # Pre-flight or diarize printed an error; the aligned snapshot is still
             # on disk so the user can retry with --resume-from-aligned.

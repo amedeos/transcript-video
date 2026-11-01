@@ -44,39 +44,51 @@ class TestCheckFfmpeg:
 
 
 class TestCheckCuda:
-    def test_cpu_request_skipped(self, monkeypatch):
-        # check_cuda_available shouldn't matter when device=cpu.
+    @staticmethod
+    def _gpu(monkeypatch, *, ct2: bool, torch: bool):
         monkeypatch.setattr(
             "transcript_video.preflight.asr_mod.check_cuda_available",
-            lambda: (False, None),
+            lambda: (ct2, "float16" if ct2 else None),
         )
+        monkeypatch.setattr(
+            "transcript_video.preflight.asr_mod.torch_cuda_available", lambda: torch
+        )
+
+    def test_cpu_request_skipped(self, monkeypatch):
+        # CUDA availability shouldn't matter when device=cpu.
+        self._gpu(monkeypatch, ct2=False, torch=False)
         r = check_cuda("cpu")
         assert r.ok and "skipped" in r.message
 
     def test_cuda_available(self, monkeypatch):
-        monkeypatch.setattr(
-            "transcript_video.preflight.asr_mod.check_cuda_available",
-            lambda: (True, "float16"),
-        )
+        self._gpu(monkeypatch, ct2=True, torch=True)
         r = check_cuda("auto")
         assert r.ok and "float16" in r.message
 
-    def test_cuda_requested_but_missing(self, monkeypatch):
-        monkeypatch.setattr(
-            "transcript_video.preflight.asr_mod.check_cuda_available",
-            lambda: (False, None),
-        )
+    def test_cuda_requested_but_missing_fails(self, monkeypatch):
+        # Explicit --device cuda + no GPU = stop, never a silent CPU run.
+        self._gpu(monkeypatch, ct2=False, torch=False)
         r = check_cuda("cuda")
-        assert not r.ok and "CUDA" in r.message
+        assert not r.ok
+        assert "ctranslate2 and torch" in r.message and "--device auto" in r.message
+
+    def test_cuda_requested_but_torch_lacks_cuda_fails(self, monkeypatch):
+        # e.g. a CPU-only torch wheel on a GPU machine.
+        self._gpu(monkeypatch, ct2=True, torch=False)
+        r = check_cuda("cuda")
+        assert not r.ok and "torch" in r.message and "ctranslate2" not in r.message
 
     def test_auto_with_no_cuda_is_ok(self, monkeypatch):
-        # auto + no CUDA = warning, not blocking.
-        monkeypatch.setattr(
-            "transcript_video.preflight.asr_mod.check_cuda_available",
-            lambda: (False, None),
-        )
+        # auto + no CUDA = falls back to CPU, not blocking.
+        self._gpu(monkeypatch, ct2=False, torch=False)
         r = check_cuda("auto")
         assert r.ok and "fall back" in r.message
+
+    def test_auto_with_partial_cuda_is_ok(self, monkeypatch):
+        self._gpu(monkeypatch, ct2=True, torch=False)
+        r = check_cuda("auto")
+        assert r.ok and "partial" in r.message
+        assert "ASR on cuda" in r.message and "alignment/diarization on cpu" in r.message
 
 
 class TestCheckWhisperxApi:

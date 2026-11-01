@@ -46,21 +46,39 @@ def check_ffmpeg() -> CheckResult:
 
 
 def check_cuda(device_request: str | None) -> CheckResult:
-    """Verify CUDA is usable when the user requested it (or wants auto-detect)."""
+    """Verify CUDA is usable when the user requested it (or wants auto-detect).
+
+    Checks both libraries that can use the GPU: ctranslate2 (ASR) and torch
+    (alignment, diarization, embeddings). An explicit ``cuda`` fails unless
+    both can use it, since the pipeline would otherwise stop at start-up.
+    ``auto`` never fails: whichever library lacks CUDA runs on CPU.
+    """
     requested = (device_request or "auto").lower()
     if requested == "cpu":
         return CheckResult("cuda", True, "skipped (--device cpu)")
 
-    cuda_ok, hint = asr_mod.check_cuda_available()
-    if cuda_ok:
+    ct2_ok, hint = asr_mod.check_cuda_available()
+    torch_ok = asr_mod.torch_cuda_available()
+    if ct2_ok and torch_ok:
         return CheckResult("cuda", True, f"available (compute_type hint: {hint})")
 
+    missing = [name for name, ok in (("ctranslate2", ct2_ok), ("torch", torch_ok)) if not ok]
     if requested == "cuda":
         return CheckResult(
-            "cuda", False, "--device cuda requested but no CUDA device is available"
+            "cuda",
+            False,
+            f"device 'cuda' requested but {' and '.join(missing)} cannot use a CUDA device; "
+            "fix the GPU setup or use --device auto / --device cpu",
         )
-    # auto: not blocking, will silently fall back to CPU.
-    return CheckResult("cuda", True, "not available; pipeline will fall back to CPU (slower)")
+    if not ct2_ok and not torch_ok:
+        return CheckResult("cuda", True, "not available; pipeline will fall back to CPU (slower)")
+    return CheckResult(
+        "cuda",
+        True,
+        f"partial: {missing[0]} cannot use CUDA, so its stages will run on CPU "
+        f"(ASR on {'cuda' if ct2_ok else 'cpu'}, "
+        f"alignment/diarization on {'cuda' if torch_ok else 'cpu'})",
+    )
 
 
 def _resolve_pipeline_class():

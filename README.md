@@ -28,6 +28,7 @@ This project is the English-language successor of [transcript-italian-video](htt
 - Python 3.10+
 - ffmpeg available on `$PATH`
 - For GPU runs: NVIDIA driver + CUDA (≥10 GB VRAM recommended; 16 GB+ for `large-v3`)
+- CPU-only machines work too, with no accuracy loss but much slower — see [Running on CPU only](#running-on-cpu-only)
 - For diarization: a HuggingFace account with the diarization model's terms accepted, plus an HF token. whisperX's current default is [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1); the older [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) is also supported via `--diarize-model`. **Both are gated repos** — visit the model page once and click "Agree and access repository" before running diarization, otherwise the pipeline aborts with a 403 GatedRepo error.
 - For the speaker-embedding cache (used by `transcript-learn`): the pipeline also fetches [pyannote/wespeaker-voxceleb-resnet34-LM](https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM) when diarization is enabled. The pre-flight check warns if access is missing; if it is, the embedding cache is skipped non-fatally and the rest of the pipeline proceeds.
 
@@ -116,8 +117,9 @@ transcript-from-video lecture.mp4 --no-diarize --txt --srt
 |------|-------------|---------|
 | `--model NAME` | whisperX model | `large-v3` |
 | `--beam_size N` | Beam search width | `5` |
-| `--device {auto,cuda,cpu}` | Device | `auto` |
-| `--compute-type TYPE` | Override (e.g. `int8`, `float16`) | auto |
+| `--device {auto,cuda,cpu}` | Device. `auto` uses the GPU when one is usable, otherwise CPU. `cuda` stops with an error if no GPU is usable | `auto` |
+| `--compute-type TYPE` | Override (e.g. `int8`, `float16`). A type the device can't run is replaced, with a warning: `int8*` by the closest supported `int8*` type, anything else by the device default | auto: `float16` on CUDA, `float32` on CPU |
+| `--threads N` | CPU threads for ASR, alignment and diarization | logical CPUs − 1 (capped by a container CPU quota) for stages on CPU; library defaults for stages on GPU |
 
 **Language**
 
@@ -479,6 +481,17 @@ transcript-from-video video.mp4 --profile meeting --md
 
 CLI flags always override the config. The config provides defaults; it never restricts.
 
+## Running on CPU only
+
+No NVIDIA GPU is required. With the default `--device auto` the pipeline uses the GPU when one is usable and switches to CPU on its own otherwise, so the same command works on a GPU desktop and on a laptop. An explicit `--device cuda` (or `device = "cuda"` in the config file) means "GPU or nothing": without a usable GPU the run stops at start-up with an error instead of quietly running for hours on CPU. Keep `device` out of a config file you share between machines.
+
+- **No accuracy loss by default.** On CPU the ASR runs in `float32`, which is at least as precise as the `float16` used on GPU (ctranslate2 has no `float16` on CPU). Alignment (wav2vec2) and diarization (pyannote) run in `float32` on both devices. Expect small numeric differences between machines, not worse transcripts.
+- **Threads.** By default stages running on CPU use all logical CPUs but one, which leaves the machine responsive. Inside a container with a CPU quota (`podman run --cpus=4`), the quota counts as the number of CPUs. Stages running on the GPU keep their libraries' own defaults. Override with `--threads N` or `threads = N` in the config file, which applies to every stage.
+- **RAM.** `large-v3` in `float32` needs about 6 GB for the model weights alone. The ASR model is freed before alignment and diarization load their own models.
+- **Faster, lighter, slightly less accurate.** Pass `--compute-type int8`: about 4× less memory for the weights and faster, at a small accuracy cost on hard audio (noise, overlapping speakers, proper names). Picking a smaller `--model` costs much more accuracy than `int8`. `large-v3-turbo` is the usual compromise; avoid `distil-*` models for non-English audio.
+- **Resuming across machines.** `--resume-from-aligned` picks the device from the current machine and the current `--device`, not from the snapshot: you can run ASR on a GPU box and diarize on a laptop, or the other way round. `parameters.device` / `compute_type` in the JSON keep recording what the ASR ran with.
+- **Two libraries, two GPU checks.** ASR uses ctranslate2; alignment, diarization and embeddings use torch. Each is checked on its own. With `auto`, a library that can't use CUDA (e.g. a CPU-only torch wheel) runs its stages on CPU and the log says so. With `cuda`, both must be able to use the GPU.
+
 ## Container (Podman / Docker)
 
 A [`Containerfile`](Containerfile) ships with the repo. It builds an image with whisperX + pyannote ready to run, on top of `nvcr.io/nvidia/cuda:12.8.1-cudnn-runtime-ubi9` — Red Hat-aligned (UBI9 + NVIDIA's own registry), CUDA tag pinned to match the `+cu128` PyTorch wheel pip installs from PyPI. ffmpeg is fetched as a static GPL build (UBI/RHEL omits ffmpeg for licensing reasons).
@@ -504,7 +517,7 @@ podman run --rm \
 
 The container's working directory is `/data`, so paths in the command line are relative to the host directory bind-mounted there. The HuggingFace cache is shared with the host so the diarization model is downloaded once across runs.
 
-For CPU-only execution, drop `--device nvidia.com/gpu=all` and pass `--device cpu` to `transcript-from-video` inside the container (slow — only sensible for short clips or smoke tests).
+For CPU-only execution, drop `--device nvidia.com/gpu=all` and don't pass `--device cuda`: with the default `--device auto` the pipeline falls back to CPU on its own (see [Running on CPU only](#running-on-cpu-only)). It is much slower than a GPU. A `--cpus` quota on the container is respected by the default thread count.
 
 ### Rootless podman: keep host groups for GPU access
 
@@ -531,6 +544,16 @@ If you authenticated on the host with `huggingface-cli login`, the token lives i
 ## Troubleshooting
 
 ### CUDA not detected
+
+With the default `--device auto` a missing GPU doesn't stop the run: the pipeline falls back to CPU, which is much slower. To check that both GPU users (ctranslate2 for ASR, torch for alignment/diarization) can see CUDA, run the pre-flight with `--device cuda`:
+
+```bash
+transcript-from-video --check --device cuda
+# [OK  ] cuda   available (compute_type hint: float16)                    ← GPU in use
+# [FAIL] cuda   device 'cuda' requested but torch cannot use a CUDA ...   ← names the library
+```
+
+The probe only checks that each library sees a CUDA device. If it reports `available` but the model load then fails on missing CUDA libraries (e.g. `libcudnn`), the CUDA wheels are missing: install the `[cuda]` extra. If it fails:
 
 ```bash
 nvidia-smi

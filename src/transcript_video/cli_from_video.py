@@ -69,7 +69,17 @@ Examples:
     model_group.add_argument(
         "--compute-type",
         default=None,
-        help="Override compute type (e.g. float16, int8, int8_float16). Default: auto.",
+        help=(
+            "Override compute type (e.g. float16, int8, int8_float16). "
+            "Default: auto (float16 on CUDA, float32 on CPU)."
+        ),
+    )
+    model_group.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        metavar="N",
+        help="CPU threads for ASR, alignment and diarization (default: logical CPUs - 1).",
     )
 
     parser.add_argument(
@@ -337,6 +347,13 @@ def main(argv: list[str] | None = None) -> None:
 
     args = parser.parse_args(argv)
 
+    # argparse applies type=int only to CLI strings, not to config-file
+    # defaults, so a TOML `threads = 4.0` would arrive here as a float.
+    if args.threads is not None and (
+        isinstance(args.threads, bool) or not isinstance(args.threads, int) or args.threads < 1
+    ):
+        parser.error(f"--threads / config 'threads' must be an integer >= 1 (got {args.threads!r})")
+
     setup_logging(quiet=args.quiet, verbose=args.verbose)
     silence_known_noisy_warnings()
 
@@ -382,6 +399,7 @@ def main(argv: list[str] | None = None) -> None:
         beam_size=args.beam_size,
         device=None if args.device == "auto" else args.device,
         compute_type=args.compute_type,
+        threads=args.threads,
         language=args.language,
         initial_prompt=_resolve_prompt(args),
         hotwords=_resolve_hotwords(args),
