@@ -277,6 +277,62 @@ def apply_to_parser(
             applied[key] = _coerce(action, value)
         except (ConfigValueError, ValueError, TypeError) as e:
             parser.error(f"config '{key}' {e} (got {value!r})")
+    for group in parser._mutually_exclusive_groups:
+        set_in_config = [
+            a.dest for a in group._group_actions
+            if a.dest in applied and _is_set(a, applied[a.dest])
+        ]
+        if len(set_in_config) > 1:
+            parser.error(
+                f"config sets {', '.join(repr(d) for d in set_in_config)}: "
+                "they are mutually exclusive, keep one"
+            )
     if applied:
         parser.set_defaults(**applied)
     return set(applied), ignored
+
+
+def _is_set(action: argparse.Action, value: Any) -> bool:
+    """Whether a config value actually selects ``action`` (``false`` / unset don't)."""
+    if action.nargs == 0:
+        return value is True
+    return value is not None
+
+
+_UNSET = object()
+
+
+def parse_args_with_config(
+    parser: argparse.ArgumentParser,
+    argv: list[str] | None,
+    cli_defaults: dict[str, Any],
+) -> tuple[argparse.Namespace, set[str], set[str]]:
+    """Apply the config, parse ``argv``, and make CLI flags win inside mutex groups.
+
+    argparse only detects conflicts between flags typed on the command line;
+    config values arrive as defaults it never "sees". Without this, a config
+    ``prompt = "X"`` would beat a CLI ``--prompt-file``, and a config
+    ``quiet = true`` would silence a CLI ``-v`` (invariant #7: the CLI always
+    wins). So when a member of a mutually exclusive group is given on the
+    command line, the other members set by the config go back to their
+    built-in defaults. Returns ``(args, applied, ignored)`` like
+    :func:`apply_to_parser`.
+    """
+    groups = [list(g._group_actions) for g in parser._mutually_exclusive_groups]
+    builtin = {a.dest: a.default for group in groups for a in group}
+    applied, ignored = apply_to_parser(parser, cli_defaults) if cli_defaults else (set(), set())
+    args = parser.parse_args(argv)
+
+    if applied & set(builtin):
+        # Re-parse with the group members pre-set to a sentinel: argparse fills
+        # in defaults only for missing attributes, so whatever is no longer the
+        # sentinel was typed on the command line.
+        probe = argparse.Namespace(**{dest: _UNSET for dest in builtin})
+        parser.parse_args(argv, namespace=probe)
+        given = {dest for dest in builtin if getattr(probe, dest) is not _UNSET}
+        for group in groups:
+            dests = {a.dest for a in group}
+            if dests & given:
+                for dest in (dests - given) & applied:
+                    setattr(args, dest, builtin[dest])
+    return args, applied, ignored

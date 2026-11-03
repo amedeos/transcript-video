@@ -336,14 +336,9 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     parser = _build_parser()
-    applied: set[str] = set()
-    ignored: set[str] = set()
-    if cli_defaults:
-        applied, ignored = project_config.apply_to_parser(parser, cli_defaults)
+    args, applied, ignored = project_config.parse_args_with_config(parser, argv, cli_defaults)
 
-    args = parser.parse_args(argv)
-
-    # Types and choices of config values were checked by apply_to_parser.
+    # Types and choices of config values were checked by parse_args_with_config.
     # 0 means "auto", so `--threads 0` on the CLI can undo a config value.
     for flag, dest in (("--threads", "threads"), ("--batch-size", "batch_size")):
         value = getattr(args, dest)

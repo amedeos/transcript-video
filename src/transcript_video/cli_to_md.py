@@ -316,10 +316,7 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     parser = _build_parser()
-    if cli_defaults:
-        project_config.apply_to_parser(parser, cli_defaults)
-
-    args = parser.parse_args(argv)
+    args, _, _ = project_config.parse_args_with_config(parser, argv, cli_defaults)
 
     setup_logging(quiet=args.quiet, verbose=args.verbose)
     silence_known_noisy_warnings()

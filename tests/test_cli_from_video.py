@@ -87,3 +87,56 @@ class TestDeviceValue:
     def test_auto_maps_to_none(self, captured):
         _run(["--device", "auto"])
         assert captured["config"].device is None
+
+
+class TestCliWinsInMutexGroups:
+    """Invariant #7 inside mutually exclusive groups: a CLI flag beats the config."""
+
+    @pytest.fixture
+    def logging_seen(self, monkeypatch) -> dict:
+        seen: dict = {}
+        monkeypatch.setattr(
+            cli_from_video, "setup_logging",
+            lambda quiet, verbose: seen.update(quiet=quiet, verbose=verbose),
+        )
+        return seen
+
+    def test_cli_prompt_file_beats_config_prompt(self, captured, tmp_path):
+        (tmp_path / "transcript-video.toml").write_text('prompt = "from config"\n')
+        (tmp_path / "glossary.txt").write_text("from file")
+        _run(["--prompt-file", "glossary.txt"])
+        assert captured["config"].initial_prompt == "from file"
+
+    def test_cli_prompt_beats_config_no_prompt(self, captured, tmp_path):
+        (tmp_path / "transcript-video.toml").write_text("no_prompt = true\n")
+        _run(["--prompt", "from cli"])
+        assert captured["config"].initial_prompt == "from cli"
+
+    def test_cli_no_hotwords_beats_config_hotwords(self, captured, tmp_path):
+        (tmp_path / "transcript-video.toml").write_text('hotwords = "OpenShift"\n')
+        _run(["--no-hotwords"])
+        assert captured["config"].hotwords == ""
+
+    def test_cli_verbose_beats_config_quiet(self, captured, logging_seen, tmp_path):
+        (tmp_path / "transcript-video.toml").write_text("quiet = true\n")
+        _run(["-v"])
+        assert logging_seen == {"quiet": False, "verbose": True}
+
+    def test_config_alone_still_applies(self, captured, logging_seen, tmp_path):
+        (tmp_path / "transcript-video.toml").write_text('prompt = "from config"\nquiet = true\n')
+        _run([])
+        assert captured["config"].initial_prompt == "from config"
+        assert logging_seen["quiet"] is True
+
+    def test_config_setting_two_members_is_rejected(self, captured, tmp_path, capsys):
+        (tmp_path / "transcript-video.toml").write_text(
+            'prompt = "a"\nprompt_file = "b.txt"\n'
+        )
+        with pytest.raises(SystemExit):
+            _run([])
+        assert "mutually exclusive" in capsys.readouterr().err
+
+    def test_false_flag_in_config_is_not_a_conflict(self, captured, tmp_path):
+        (tmp_path / "transcript-video.toml").write_text('prompt = "a"\nno_prompt = false\n')
+        _run([])
+        assert captured["config"].initial_prompt == "a"
