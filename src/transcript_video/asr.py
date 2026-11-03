@@ -402,6 +402,32 @@ def available_cpu_count() -> int:
     return min(count, limit) if limit else count
 
 
+# Standard thread-count variables, honored like an explicit --threads when
+# --threads / config `threads` is not given (first one set wins).
+THREAD_ENV_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS")
+
+
+def env_thread_limit() -> tuple[str, int] | None:
+    """``(variable, threads)`` from OMP_NUM_THREADS / MKL_NUM_THREADS, or ``None``.
+
+    OpenMP allows a comma-separated list for nested levels ("4,2"); the first
+    level is the one that counts. Invalid or non-positive values are ignored
+    with a warning.
+    """
+    for var in THREAD_ENV_VARS:
+        raw = os.environ.get(var, "").strip()
+        if not raw:
+            continue
+        try:
+            value = int(raw.split(",")[0].strip())
+        except ValueError:
+            value = 0
+        if value > 0:
+            return var, value
+        _warn_once(f"Ignoring {var}={raw!r}: not a positive integer.")
+    return None
+
+
 def resolve_cpu_threads(requested: int | None) -> int:
     """CPU threads to use: the explicit value, else logical CPUs minus one (min 1)."""
     if requested is not None and requested > 0:

@@ -238,15 +238,22 @@ def _resolve_devices(config: RunConfig) -> asr_mod.DevicePlan:
 def _configure_threads(config: RunConfig, devices: asr_mod.DevicePlan) -> int | None:
     """Apply the CPU thread policy; return the thread count for ctranslate2 (or ``None``).
 
-    An explicit ``--threads`` applies to every library that runs a stage.
-    Otherwise the default (CPUs - 1) is applied only to the libraries running
-    on CPU: ctranslate2 when the ASR does, torch when any torch work does (VAD,
-    alignment, diarization). A library on the GPU keeps its own default;
-    torch, for instance, defaults to the physical core count. A library with
-    no stage to run is left alone.
+    An explicit count applies to every library that runs a stage. It comes
+    from ``--threads`` / config ``threads``, else from ``OMP_NUM_THREADS`` /
+    ``MKL_NUM_THREADS`` (a limit set in the environment, e.g. on a shared
+    server, is honored). Otherwise the default (CPUs - 1) is applied only to
+    the libraries running on CPU: ctranslate2 when the ASR does, torch when
+    any torch work does (VAD, alignment, diarization). A library on the GPU
+    keeps its own default; torch, for instance, defaults to the physical core
+    count. A library with no stage to run is left alone.
     """
-    explicit = config.threads is not None and config.threads > 0
-    threads = asr_mod.resolve_cpu_threads(config.threads)
+    requested = config.threads if config.threads is not None and config.threads > 0 else None
+    source = ""
+    if requested is None and (env := asr_mod.env_thread_limit()):
+        var, requested = env
+        source = f" (from {var})"
+    explicit = requested is not None
+    threads = asr_mod.resolve_cpu_threads(requested)
     torch_runs = devices.torch is not None or devices.vad is not None
     asr_threads = (
         threads if devices.asr is not None and (explicit or devices.asr == "cpu") else None
@@ -255,7 +262,7 @@ def _configure_threads(config: RunConfig, devices: asr_mod.DevicePlan) -> int | 
     if torch_threads is not None:
         asr_mod.apply_torch_threads(torch_threads)
     if asr_threads is not None or torch_threads is not None:
-        logger.info("CPU threads: %d", threads)
+        logger.info("CPU threads: %d%s", threads, source)
     elif devices.uses_device:
         logger.info("CPU threads: library defaults (GPU run; --threads N to override).")
     return asr_threads

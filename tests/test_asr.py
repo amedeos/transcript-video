@@ -408,6 +408,32 @@ class TestBatchSize:
         assert asr.resolve_batch_size(0, "cpu") == 4
 
 
+class TestEnvThreadLimit:
+    def test_unset(self):
+        assert asr.env_thread_limit() is None
+
+    def test_omp_wins_over_mkl(self, monkeypatch):
+        monkeypatch.setenv("OMP_NUM_THREADS", "4")
+        monkeypatch.setenv("MKL_NUM_THREADS", "2")
+        assert asr.env_thread_limit() == ("OMP_NUM_THREADS", 4)
+
+    def test_mkl_alone(self, monkeypatch):
+        monkeypatch.setenv("MKL_NUM_THREADS", "3")
+        assert asr.env_thread_limit() == ("MKL_NUM_THREADS", 3)
+
+    def test_nested_omp_list_takes_the_first_level(self, monkeypatch):
+        monkeypatch.setenv("OMP_NUM_THREADS", "6,2")
+        assert asr.env_thread_limit() == ("OMP_NUM_THREADS", 6)
+
+    @pytest.mark.parametrize("raw", ["0", "-2", "four", " "])
+    def test_invalid_values_are_ignored(self, monkeypatch, caplog, raw):
+        monkeypatch.setenv("OMP_NUM_THREADS", raw)
+        with caplog.at_level(logging.WARNING, logger="transcript_video.asr"):
+            assert asr.env_thread_limit() is None
+        if raw.strip():
+            assert "Ignoring OMP_NUM_THREADS" in caplog.text
+
+
 class TestThreads:
     def test_explicit_value_wins(self, monkeypatch):
         monkeypatch.setattr(asr, "available_cpu_count", lambda: 8)

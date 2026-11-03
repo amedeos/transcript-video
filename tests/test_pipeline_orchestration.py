@@ -682,6 +682,40 @@ class TestDecodingOptions:
         }
 
 
+class TestThreadEnv:
+    """OMP_NUM_THREADS / MKL_NUM_THREADS count as an explicit --threads."""
+
+    @pytest.fixture
+    def seen(self, monkeypatch) -> dict:
+        seen: dict = {}
+        monkeypatch.setattr(
+            pipeline_mod.asr_mod, "apply_torch_threads", lambda n: seen.__setitem__("torch", n)
+        )
+        return seen
+
+    def test_env_limit_applies_to_every_stage(self, fake_input, seen, monkeypatch, caplog):
+        monkeypatch.setenv("OMP_NUM_THREADS", "4")
+        plan = pipeline_mod.asr_mod.DevicePlan(asr="cuda", torch="cuda", vad="cuda")
+        with caplog.at_level("INFO", logger="transcript_video.pipeline"):
+            assert pipeline_mod._configure_threads(_config(fake_input), plan) == 4
+        assert seen == {"torch": 4}
+        assert "CPU threads: 4 (from OMP_NUM_THREADS)" in caplog.text
+
+    def test_cli_threads_beat_the_env(self, fake_input, seen, monkeypatch):
+        monkeypatch.setenv("OMP_NUM_THREADS", "4")
+        config = _config(fake_input)
+        config.threads = 2
+        plan = pipeline_mod.asr_mod.DevicePlan(asr="cpu", torch="cpu", vad="cpu")
+        assert pipeline_mod._configure_threads(config, plan) == 2
+        assert seen == {"torch": 2}
+
+    def test_no_env_keeps_the_default_policy(self, fake_input, seen, monkeypatch):
+        monkeypatch.setattr(pipeline_mod.asr_mod, "available_cpu_count", lambda: 8)
+        plan = pipeline_mod.asr_mod.DevicePlan(asr="cuda", torch="cuda", vad="cuda")
+        assert pipeline_mod._configure_threads(_config(fake_input), plan) is None
+        assert seen == {}
+
+
 class TestThreadPolicyEdges:
     def test_zero_threads_in_runconfig_is_auto(self, stub_pipeline, fake_input, monkeypatch):
         """RunConfig(threads=0) on a GPU run keeps library defaults, like None."""
