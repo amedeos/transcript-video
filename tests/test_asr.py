@@ -80,6 +80,14 @@ class TestCudaProbe:
         _install_fake_ctranslate2(monkeypatch, device_count=1, compute_types=CUDA_TYPES)
         assert asr.check_cuda_available() == (True, "float16")
 
+    def test_pascal_gpu_hint_is_float32_not_int8(self, monkeypatch):
+        # GTX 10xx (compute capability 6.1): no float16, but int8 kernels.
+        # The default must stay lossless: float32, never upstream's int8.
+        _install_fake_ctranslate2(
+            monkeypatch, device_count=1, compute_types={"float32", "int8", "int8_float32"}
+        )
+        assert asr.check_cuda_available() == (True, "float32")
+
     def test_hint_is_always_a_supported_type(self, monkeypatch):
         # Old GPU (< compute capability 6.1): no float16/int8 kernels.
         _install_fake_ctranslate2(monkeypatch, device_count=1, compute_types={"float32"})
@@ -260,6 +268,31 @@ class TestPlanDevices:
         plan = _plan(None)
         assert (plan.asr, plan.vad, plan.torch) == ("cpu", "cpu", "cuda")
         assert "Mixed devices" in plan.notes[0]
+
+    @pytest.fixture
+    def old_gpu(self, monkeypatch):
+        """A GPU below the float16 minimum (e.g. GTX 1080), CUDA torch."""
+        monkeypatch.setattr(asr, "check_cuda_available", lambda: (True, "float32"))
+        monkeypatch.setattr(asr, "torch_cuda_available", lambda: True)
+
+    def test_old_gpu_auto_runs_asr_on_cpu(self, old_gpu):
+        plan = _plan(None)
+        assert (plan.asr, plan.vad, plan.torch, plan.error) == ("cpu", "cpu", "cuda", None)
+        assert len(plan.notes) == 1 and "below the float16 minimum" in plan.notes[0]
+        assert asr.resolve_compute_type(plan.asr, None) == "float32"
+
+    def test_old_gpu_explicit_cuda_uses_it_in_float32(self, old_gpu):
+        plan = _plan("cuda")
+        assert (plan.asr, plan.vad, plan.torch, plan.error) == ("cuda", "cuda", "cuda", None)
+        assert "float32" in plan.notes[0]
+        assert asr.resolve_compute_type(plan.asr, None) == "float32"
+
+    def test_old_gpu_without_torch_cuda_is_all_cpu(self, monkeypatch):
+        monkeypatch.setattr(asr, "check_cuda_available", lambda: (True, "float32"))
+        monkeypatch.setattr(asr, "torch_cuda_available", lambda: False)
+        plan = _plan(None)
+        assert (plan.asr, plan.vad, plan.torch) == ("cpu", "cpu", "cpu")
+        assert len(plan.notes) == 1 and "below the float16 minimum" in plan.notes[0]
 
     def test_resume_with_cuda_needs_only_torch(self, monkeypatch):
         # ctranslate2 lacks CUDA, but a resume runs no ASR.

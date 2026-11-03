@@ -102,6 +102,15 @@ class TestCheckCuda:
         assert r.ok and "partial" not in r.message
         assert "fall back to CPU" in r.message and "ASR runs on cpu too" in r.message
 
+    def test_old_gpu_is_reported_and_asr_goes_to_cpu(self, monkeypatch):
+        monkeypatch.setattr(
+            "transcript_video.preflight.asr_mod.check_cuda_available", lambda: (True, "float32")
+        )
+        monkeypatch.setattr("transcript_video.preflight.asr_mod.torch_cuda_available", lambda: True)
+        r = check_cuda("auto")
+        assert r.ok and "ASR on cpu" in r.message and "alignment/diarization on cuda" in r.message
+        assert "below the float16 minimum" in r.message
+
     def test_resume_with_cuda_ignores_ctranslate2(self, monkeypatch):
         # A resume runs no ASR: only torch must be able to use CUDA.
         self._gpu(monkeypatch, ct2=False, torch=True)

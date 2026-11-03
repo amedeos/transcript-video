@@ -27,7 +27,7 @@ This project is the English-language successor of [transcript-italian-video](htt
 
 - Python 3.10+
 - ffmpeg available on `$PATH`
-- For GPU runs: NVIDIA driver + CUDA (≥10 GB VRAM recommended; 16 GB+ for `large-v3`)
+- For GPU runs: NVIDIA driver + CUDA (≥10 GB VRAM recommended; 16 GB+ for `large-v3`). Minimum for the ASR: a GPU with float16 support (compute capability 7.0+: GTX 16xx, RTX 20xx and newer). On an older GPU (e.g. GTX 10xx), `--device auto` runs the ASR on CPU in float32, which is lossless but slower, while alignment and diarization still use the GPU. An explicit `--device cuda` uses the old GPU for the ASR anyway, in float32.
 - CPU-only machines work too, with no accuracy loss but much slower — see [Running on CPU only](#running-on-cpu-only)
 - For diarization: a HuggingFace account with the diarization model's terms accepted, plus an HF token. whisperX's current default is [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1); the older [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) is also supported via `--diarize-model`. **Both are gated repos** — visit the model page once and click "Agree and access repository" before running diarization, otherwise the pipeline aborts with a 403 GatedRepo error.
 - For the speaker-embedding cache (used by `transcript-learn`): the pipeline also fetches [pyannote/wespeaker-voxceleb-resnet34-LM](https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM) when diarization is enabled. The pre-flight check warns if access is missing; if it is, the embedding cache is skipped non-fatally and the rest of the pipeline proceeds.

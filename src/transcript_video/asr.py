@@ -37,8 +37,16 @@ COMPUTE_TYPES = (
     "int8", "int8_float32", "int8_float16", "int8_bfloat16", "int16",
 )
 
-# Preferred CUDA compute types, best first (float16 first: reference-project parity).
-_CUDA_PREFERENCE = ("float16", "int8_float16", "int8", "float32")
+# Preferred CUDA compute types, best first. float16 first, as in the reference
+# project. Without float16 (compute capability < 7.0, e.g. GTX 10xx), float32,
+# never int8: the default must stay lossless (upstream fell back to int8).
+_CUDA_PREFERENCE = ("float16", "float32")
+
+# Minimum GPU for the ASR: ctranslate2 must support float16 on it (compute
+# capability >= 7.0: GTX 16xx / RTX 20xx and newer). Below it, --device auto
+# runs the ASR on CPU (float32, lossless); an explicit --device cuda still
+# uses the GPU, in float32. torch stages are unaffected.
+MIN_GPU_COMPUTE_TYPE = "float16"
 
 # ASR batch size: how many 30 s VAD chunks whisperX decodes at once. Each chunk
 # is padded to 30 s and decoded on its own, so the batch changes speed and
@@ -185,12 +193,15 @@ def plan_devices(requested: str | None, *, run_asr: bool, run_torch: bool) -> De
         cpu_if = lambda runs: "cpu" if runs else None  # noqa: E731
         return DevicePlan(asr=cpu_if(run_asr), torch=cpu_if(run_torch), vad=cpu_if(run_asr))
 
-    ct2_ok = run_asr and check_cuda_available()[0]
+    ct2_cuda, ct2_hint = check_cuda_available() if run_asr else (False, None)
+    # A GPU below the minimum (no float16) is used only on an explicit request.
+    ct2_ok = ct2_cuda and ct2_hint == MIN_GPU_COMPUTE_TYPE
+    below_minimum = ct2_cuda and not ct2_ok
     torch_ok = run_torch and torch_cuda_available()
 
     if req == "cuda":
         missing = []
-        if run_asr and not ct2_ok:
+        if run_asr and not ct2_cuda:
             missing.append("ASR (ctranslate2)")
         if run_torch and not torch_ok:
             missing.append("alignment/diarization (torch)")
@@ -201,12 +212,25 @@ def plan_devices(requested: str | None, *, run_asr: bool, run_torch: bool) -> De
                 "(use CPU when there is no GPU) or --device cpu."
             ))
         cuda_if = lambda runs: "cuda" if runs else None  # noqa: E731
-        return DevicePlan(asr=cuda_if(run_asr), torch=cuda_if(run_torch), vad=cuda_if(run_asr))
+        notes = (
+            ("GPU below the float16 minimum (compute capability < 7.0): the ASR runs on "
+             "cuda in float32 because --device cuda was requested.",)
+            if below_minimum else ()
+        )
+        return DevicePlan(
+            asr=cuda_if(run_asr), torch=cuda_if(run_torch), vad=cuda_if(run_asr), notes=notes
+        )
 
     asr = ("cuda" if ct2_ok else "cpu") if run_asr else None
     torch_dev = ("cuda" if torch_ok else "cpu") if run_torch else None
     vad = asr
     notes: list[str] = []
+    if below_minimum:
+        notes.append(
+            "GPU below the float16 minimum (compute capability < 7.0, e.g. GTX 10xx): "
+            "the ASR runs on cpu in float32 (lossless, slower). Pass --device cuda to "
+            "run it on this GPU in float32 anyway."
+        )
     if asr == "cuda" and torch_dev == "cpu":
         if cpu_vad_supported():
             vad = "cpu"
@@ -220,7 +244,7 @@ def plan_devices(requested: str | None, *, run_asr: bool, run_torch: bool) -> De
                 "torch cannot use CUDA, and this whisperX can't run its VAD apart from "
                 "the ASR: the ASR runs on cpu too."
             )
-    elif asr == "cpu" and torch_dev == "cuda":
+    elif asr == "cpu" and torch_dev == "cuda" and not below_minimum:
         notes.append(
             "Mixed devices: ASR on cpu (ctranslate2 cannot use CUDA), "
             "alignment/diarization on cuda."
@@ -231,8 +255,8 @@ def plan_devices(requested: str | None, *, run_asr: bool, run_torch: bool) -> De
 def resolve_compute_type(device: str, requested_compute: str | None) -> str:
     """The ctranslate2 compute type for ``device``.
 
-    - Unset, ``auto`` or ``default``: the best CUDA type (``float16``
-      preferred, but always one the GPU supports) on GPU, ``float32`` on CPU.
+    - Unset, ``auto`` or ``default``: ``float16`` on GPU (``float32`` on a
+      GPU below the float16 minimum), ``float32`` on CPU.
       Our ``auto`` is this lossless default, **not** ctranslate2's ``auto``,
       which picks the fastest type (int8 on CPU). ``default`` resolves here too:
       whisperX would rewrite it to float16/float32 anyway, without checking the

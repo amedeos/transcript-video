@@ -75,8 +75,7 @@ Examples:
         metavar="TYPE",
         help=(
             f"Override compute type, one of: {', '.join(COMPUTE_TYPES)} (any case). "
-            "Unset, 'auto' or 'default': float16 on CUDA (or the best type the GPU "
-            "supports), float32 on CPU (lossless)."
+            "Unset, 'auto' or 'default': float16 on CUDA, float32 on CPU (lossless)."
         ),
     )
     model_group.add_argument(
