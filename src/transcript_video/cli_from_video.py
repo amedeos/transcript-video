@@ -81,7 +81,11 @@ Examples:
         type=int,
         default=None,
         metavar="N",
-        help="CPU threads for ASR, alignment and diarization (default or 0: logical CPUs - 1).",
+        help=(
+            "CPU threads for ASR, alignment and diarization. Default or 0: logical CPUs - 1 "
+            "(capped by a container CPU quota) for stages on CPU; stages on the GPU keep "
+            "their libraries' defaults. An explicit N applies to every stage."
+        ),
     )
     model_group.add_argument(
         "--batch-size",

@@ -160,7 +160,7 @@ These optimizations are intentionally preserved verbatim from `trascrivi.py` (on
 - **Decoding options go in at model load, not to `transcribe()`.** whisperX's batched `FasterWhisperPipeline.transcribe` accepts only audio / batch size / language / task / chunk size / progress arguments. Prompt, hotwords, beam size and the anti-loop values are `asr_options` of `whisperx.load_model` (`asr.build_asr_options` → `asr.load_whisperx_model`). Passing them to `transcribe()` raised `TypeError` on every `--prompt` / `--hotwords` / `--anti-loop` run. The test stub in `test_pipeline_orchestration.py` mirrors the real `transcribe` signature, so the bug can't come back silently.
 - **Initial prompt** (mutex group): `--prompt` / `--prompt-file` / `--no-prompt`. `None` means "unset", `""` means "explicitly disabled".
 - **Hotwords** (mutex group): same tri-state convention as the prompt group.
-- **CUDA detection** (`asr.check_cuda_available`): probes `ctranslate2.get_supported_compute_types("cuda")` and prefers `float16`. Same logic as `trascrivi.py:15-22`.
+- **CUDA compute-type preference** (`asr.check_cuda_available`): like `trascrivi.py:15-22`, it reads `ctranslate2.get_supported_compute_types("cuda")` and prefers `float16`. The probe itself deliberately differs from upstream: it requires a CUDA device, is cached, and has a fallback order. See "CUDA probe is cached and requires a device" below, and don't restore the upstream probe.
 
 If you find yourself "improving" any of these, double-check the upstream behavior first — they were chosen deliberately.
 

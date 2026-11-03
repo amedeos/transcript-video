@@ -8,7 +8,7 @@
 
 Transcribe and diarize video/audio using [whisperX](https://github.com/m-bain/whisperX) — which combines [faster-whisper](https://github.com/SYSTRAN/faster-whisper) with wav2vec2 forced alignment and [pyannote.audio](https://github.com/pyannote/pyannote-audio) speaker diarization — and emit JSON, SRT, plain text, and a human-readable Markdown transcript with YAML frontmatter.
 
-This project is the English-language successor of [transcript-italian-video](https://github.com/amedeos/transcript-italian-video). It keeps every optimization from the reference (initial prompt, hotwords, anti-loop) and adds:
+This project is the English-language successor of [transcript-italian-video](https://github.com/amedeos/transcript-italian-video). It keeps the reference's initial prompt and hotwords (and accepts its `--anti-loop` flag, which whisperX's batched decoding currently ignores; see the options table) and adds:
 
 - **Speaker diarization** via pyannote (whisperX integration).
 - **Language autodetect** by default (`--language` still available to force).
@@ -551,7 +551,7 @@ With the default `--device auto` a missing GPU doesn't stop the run: the pipelin
 ```bash
 transcript-from-video --check --device cuda
 # [OK  ] cuda   available (compute_type hint: float16)                    ← GPU in use
-# [FAIL] cuda   device 'cuda' requested but torch cannot use a CUDA ...   ← names the library
+# [FAIL] cuda   device 'cuda' was requested (--device or config) but alignment/diarization (torch) cannot use a CUDA device. ...   ← names the library
 ```
 
 The probe only checks that each library sees a CUDA device. If it reports `available` but the model load then fails on missing CUDA libraries (e.g. `libcudnn`), the CUDA wheels are missing: install the `[cuda]` extra. If it fails:
