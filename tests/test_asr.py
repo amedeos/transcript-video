@@ -169,6 +169,10 @@ class TestResolveComputeType:
     def test_explicit_int8_on_cpu_is_kept(self, no_gpu):
         assert asr.resolve_compute_type("cpu", "int8") == "int8"
 
+    @pytest.mark.parametrize("value", ["INT8", " Int8 "])
+    def test_case_and_spaces_dont_lose_the_quantization(self, no_gpu, value):
+        assert asr.resolve_compute_type("cpu", value) == "int8"
+
     def test_float16_on_cpu_becomes_float32(self, no_gpu, caplog):
         with caplog.at_level(logging.WARNING, logger="transcript_video.asr"):
             assert asr.resolve_compute_type("cpu", "float16") == "float32"

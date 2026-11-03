@@ -27,6 +27,16 @@ logger = logging.getLogger("transcript_video.asr")
 # reference project, which used int8 on CPU and gave up a little accuracy for speed.
 CPU_DEFAULT_COMPUTE_TYPE = "float32"
 
+# Every compute type ctranslate2 knows, plus our "auto"/"default" aliases for
+# the lossless default (see resolve_compute_type). The CLI accepts only these,
+# so a typo or an unknown name stops the run instead of silently becoming
+# float32 (and losing a quantization asked for to save RAM).
+COMPUTE_TYPES = (
+    "auto", "default",
+    "float32", "float16", "bfloat16",
+    "int8", "int8_float32", "int8_float16", "int8_bfloat16", "int16",
+)
+
 # Preferred CUDA compute types, best first (float16 first: reference-project parity).
 _CUDA_PREFERENCE = ("float16", "int8_float16", "int8", "float32")
 
@@ -235,6 +245,7 @@ def resolve_compute_type(device: str, requested_compute: str | None) -> str:
     hint = check_cuda_available()[1] if device == "cuda" else None
     default = (hint or "float16") if device == "cuda" else CPU_DEFAULT_COMPUTE_TYPE
 
+    requested_compute = (requested_compute or "").strip().lower()
     if not requested_compute or requested_compute in ("auto", "default"):
         return default
 

@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from . import project_config
-from .asr import CPU_DEFAULT_BATCH_SIZE, GPU_DEFAULT_BATCH_SIZE
+from .asr import COMPUTE_TYPES, CPU_DEFAULT_BATCH_SIZE, GPU_DEFAULT_BATCH_SIZE
 from .config import (
     DiarizationConfig,
     FrontmatterConfig,
@@ -70,8 +70,11 @@ Examples:
     model_group.add_argument(
         "--compute-type",
         default=None,
+        type=str.lower,
+        choices=COMPUTE_TYPES,
+        metavar="TYPE",
         help=(
-            "Override compute type (e.g. float16, int8, int8_float16). "
+            f"Override compute type, one of: {', '.join(COMPUTE_TYPES)} (any case). "
             "Unset, 'auto' or 'default': float16 on CUDA (or the best type the GPU "
             "supports), float32 on CPU (lossless)."
         ),

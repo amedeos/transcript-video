@@ -140,3 +140,30 @@ class TestCliWinsInMutexGroups:
         (tmp_path / "transcript-video.toml").write_text('prompt = "a"\nno_prompt = false\n')
         _run([])
         assert captured["config"].initial_prompt == "a"
+
+
+class TestComputeTypeValue:
+    """Only known ctranslate2 types; a typo must not silently become float32."""
+
+    @pytest.mark.parametrize("value", ["INT8", "Int8", "int8"])
+    def test_cli_is_case_insensitive(self, captured, value):
+        _run(["--compute-type", value])
+        assert captured["config"].compute_type == "int8"
+
+    def test_cli_typo_is_rejected(self, captured, capsys):
+        with pytest.raises(SystemExit):
+            _run(["--compute-type", "flaot16"])
+        assert "invalid choice" in capsys.readouterr().err
+        assert "config" not in captured
+
+    def test_config_value_is_case_insensitive(self, captured, tmp_path):
+        (tmp_path / "transcript-video.toml").write_text('compute_type = "Int8_Float32"\n')
+        _run([])
+        assert captured["config"].compute_type == "int8_float32"
+
+    @pytest.mark.parametrize("value", ['"int4"', "16"])
+    def test_config_unknown_value_is_rejected(self, captured, tmp_path, capsys, value):
+        (tmp_path / "transcript-video.toml").write_text(f"compute_type = {value}\n")
+        with pytest.raises(SystemExit):
+            _run([])
+        assert "config 'compute_type' must be one of" in capsys.readouterr().err

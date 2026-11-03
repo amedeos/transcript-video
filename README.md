@@ -118,7 +118,7 @@ transcript-from-video lecture.mp4 --no-diarize --txt --srt
 | `--model NAME` | whisperX model | `large-v3` |
 | `--beam_size N` | Beam search width | `5` |
 | `--device {auto,cuda,cpu}` | Device. `auto` uses the GPU when one is usable, otherwise CPU. `cuda` stops with an error if no GPU is usable | `auto` |
-| `--compute-type TYPE` | Override (e.g. `int8`, `float16`). A type the device can't run is replaced, with a warning: `int8*` by the closest supported `int8*` type, anything else by the device default. `auto` and `default` mean the lossless default below | `float16` on CUDA, `float32` on CPU |
+| `--compute-type TYPE` | Override (e.g. `int8`, `float16`; any case). Only ctranslate2's types are accepted, so a typo stops with an error. A type the device can't run is replaced, with a warning: `int8*` by the closest supported `int8*` type, anything else by the device default. `auto` and `default` mean the lossless default below | `float16` on CUDA, `float32` on CPU |
 | `--threads N` | CPU threads for ASR, alignment and diarization. `0` means auto (undoes a config value) | logical CPUs − 1 (capped by a container CPU quota) for stages on CPU; library defaults for stages on GPU |
 | `--batch-size N` | ASR chunks decoded at once. Changes speed and RAM, never the transcript. Lower it if the run is killed for lack of memory. `0` means auto | `16` on CUDA, `4` on CPU |
 
