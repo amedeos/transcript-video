@@ -169,8 +169,8 @@ class DevicePlan:
 
     @property
     def uses_device(self) -> bool:
-        """At least one stage runs (on any device)."""
-        return any((self.asr, self.torch, self.vad))
+        """At least one stage runs (on any device). ``vad`` implies ``asr``."""
+        return any((self.asr, self.torch))
 
 
 def plan_devices(requested: str | None, *, run_asr: bool, run_torch: bool) -> DevicePlan:
@@ -556,6 +556,10 @@ def load_whisperx_model(
         kwargs["threads"] = threads
     if vad_device is not None and vad_device != device:
         kwargs["vad_model"] = _build_vad(vad_device)
+        # whisperX print()s "Use manually assigned vad_model..." here; keep stdout
+        # for our "Files written:" summary, which scripts may parse.
+        with contextlib.redirect_stdout(sys.stderr):
+            return whisperx.load_model(model_name, **kwargs)
     return whisperx.load_model(model_name, **kwargs)
 
 

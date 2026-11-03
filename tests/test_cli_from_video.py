@@ -70,7 +70,7 @@ class TestZeroMeansAuto:
 
 
 class TestDeviceValue:
-    """A config `device` bypasses argparse choices, so main() validates it."""
+    """A config `device` bypasses argparse choices; apply_to_parser validates it."""
 
     def test_config_device_is_lowercased(self, captured, tmp_path):
         (tmp_path / "transcript-video.toml").write_text('device = "CUDA"\n')

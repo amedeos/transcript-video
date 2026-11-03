@@ -254,7 +254,8 @@ def _configure_threads(config: RunConfig, devices: asr_mod.DevicePlan) -> int | 
         source = f" (from {var})"
     explicit = requested is not None
     threads = asr_mod.resolve_cpu_threads(requested)
-    torch_runs = devices.torch is not None or devices.vad is not None
+    # vad is set only together with asr, and asr implies torch: torch covers it.
+    torch_runs = devices.torch is not None
     asr_threads = (
         threads if devices.asr is not None and (explicit or devices.asr == "cpu") else None
     )

@@ -388,6 +388,20 @@ class TestVadDevice:
         asr.load_whisperx_model("large-v3", "cuda", "float16", {"beam_size": 5}, vad_device=vad_device)
         assert fake_whisperx == {"device": "cuda", "vad_model": None}
 
+    def test_whisperx_notice_goes_to_stderr(self, monkeypatch, capsys):
+        fake = types.ModuleType("whisperx")
+
+        def load_model(name, device, compute_type="float16", asr_options=None, vad_model=None):
+            print("Use manually assigned vad_model. vad_method is ignored.")
+            return "model"
+
+        fake.load_model = load_model
+        monkeypatch.setitem(sys.modules, "whisperx", fake)
+        monkeypatch.setattr(asr, "_build_vad", lambda device: f"vad@{device}")
+        asr.load_whisperx_model("large-v3", "cuda", "float16", {"beam_size": 5}, vad_device="cpu")
+        out, err = capsys.readouterr()
+        assert out == "" and "manually assigned vad_model" in err
+
     def test_cpu_vad_unsupported_without_whisperx(self, monkeypatch):
         monkeypatch.setitem(sys.modules, "whisperx", None)
         assert asr.cpu_vad_supported() is False
