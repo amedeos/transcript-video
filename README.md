@@ -173,7 +173,7 @@ After alignment, an `*_transcript.aligned.json` snapshot is written automaticall
 
 | Flag | Description |
 |------|-------------|
-| `--resume-from-aligned PATH` | Skip ASR + alignment; load the snapshot, run diarization, write outputs. The source video path is read from the snapshot if not given as a positional. |
+| `--resume-from-aligned PATH` | Skip ASR + alignment; load the snapshot, run diarization, write outputs. The source video path is read from the snapshot if not given as a positional. Also accepts the `*_transcript.json` of a `--no-diarize` run, to add speakers later; a transcript that already has speakers is refused (use `transcript-to-md` to re-render it). |
 
 **Project config**
 

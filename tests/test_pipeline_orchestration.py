@@ -358,6 +358,34 @@ class TestResumeFromAligned:
         assert final["stage"] == "complete"
         assert any("speaker" in s for s in final["segments"])
 
+    def test_resume_refuses_a_finished_transcript_with_speakers(
+        self, stub_pipeline, fake_input, tmp_path, monkeypatch, capsys
+    ):
+        """Invariant #5: re-diarizing a finished JSON would clobber its speakers."""
+        written = pipeline_mod.run_pipeline(_config(fake_input))
+
+        def _never(*a, **kw):
+            raise AssertionError("diarization must not start")
+
+        monkeypatch.setattr(pipeline_mod.diarize_mod, "diarize_and_assign", _never)
+        config = _config(fake_input)
+        config.resume_from_aligned = written["json"]
+        with pytest.raises(SystemExit):
+            pipeline_mod.run_pipeline(config)
+        assert "speakers already assigned" in capsys.readouterr().err
+
+    def test_resume_accepts_a_no_diarize_transcript(self, stub_pipeline, fake_input, tmp_path):
+        """A --no-diarize run writes no aligned snapshot: its JSON is the way to diarize later."""
+        first = _config(fake_input)
+        first.diarization = DiarizationConfig(enabled=False)
+        written = pipeline_mod.run_pipeline(first)
+        assert not (tmp_path / "video_transcript.aligned.json").exists()
+
+        config = _config(fake_input)
+        config.resume_from_aligned = written["json"]
+        final = json.loads(pipeline_mod.run_pipeline(config)["json"].read_text(encoding="utf-8"))
+        assert any("speaker" in seg for seg in final["segments"])
+
     def test_resume_gpu_snapshot_on_cpu_only_machine(
         self, stub_pipeline, fake_input, tmp_path, monkeypatch
     ):

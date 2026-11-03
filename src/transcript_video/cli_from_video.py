@@ -145,9 +145,9 @@ Examples:
         "--resume-from-aligned",
         default=None,
         help=(
-            "Path to a previously-written *_transcript.aligned.json. Skips ASR + alignment "
-            "and jumps straight to diarization. The source video is taken from the snapshot "
-            "(or override by passing input_file)."
+            "Path to a previously-written *_transcript.aligned.json (or the *_transcript.json "
+            "of a --no-diarize run). Skips ASR + alignment and jumps straight to diarization. "
+            "The source video is taken from the snapshot (or override by passing input_file)."
         ),
     )
 

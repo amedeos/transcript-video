@@ -114,7 +114,7 @@ The pipeline writes two persistence layers:
 
 Both share the same schema. The top-level `stage` field discriminates them (`"aligned"` vs `"complete"`). When refactoring `_build_payload()`, keep both stages going through the same builder so they stay structurally identical.
 
-`--resume-from-aligned PATH` skips ASR + alignment and feeds the snapshot straight to diarization. The aligned snapshot is the only legitimate input form for resuming — don't accept `*_transcript.json` for resume (its segments already carry speakers, so re-diarizing would clobber them).
+`--resume-from-aligned PATH` skips ASR + alignment and feeds the snapshot straight to diarization. The aligned snapshot is the legitimate input form for resuming. `pipeline._load_aligned_payload` refuses a `*_transcript.json` that already carries speakers (segments, `speaker_clusters` or `speaker_identities`), because re-diarizing would clobber them. The one exception is a finished transcript with no speakers: a `--no-diarize` run writes no aligned snapshot, so its JSON is the only way to add diarization later.
 
 ### 6. Pre-flight runs by default
 

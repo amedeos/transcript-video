@@ -355,8 +355,23 @@ def _run_asr_and_align(
     return payload, audio
 
 
+def _has_speakers(payload: dict[str, Any]) -> bool:
+    """Whether a payload already carries diarization results."""
+    if payload.get("speaker_clusters") or payload.get("speaker_identities"):
+        return True
+    return any(seg.get("speaker") for seg in payload.get("segments") or [])
+
+
 def _load_aligned_payload(path: Path) -> dict[str, Any]:
-    """Load a previously-written aligned snapshot."""
+    """Load a snapshot to resume from (invariant #5).
+
+    Accepted: the ``*_transcript.aligned.json`` snapshot (stage ``aligned``),
+    and a finished transcript (stage ``complete``) that carries no speakers.
+    That is the output of a ``--no-diarize`` run, which writes no aligned
+    snapshot, so it is the only way to add diarization later. A finished
+    transcript *with* speakers is refused: re-diarizing it would overwrite
+    its speaker labels and identities.
+    """
     import json
 
     if not path.exists():
@@ -369,6 +384,15 @@ def _load_aligned_payload(path: Path) -> dict[str, Any]:
     if stage not in (STAGE_ALIGNED, STAGE_COMPLETE):
         print(
             f"Error: {path} has unexpected stage '{stage}'; expected '{STAGE_ALIGNED}'.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if stage == STAGE_COMPLETE and _has_speakers(payload):
+        print(
+            f"Error: {path} is a finished transcript with speakers already assigned. "
+            "Resuming would re-diarize it and overwrite its speaker labels and "
+            "identities. Resume from the *_transcript.aligned.json snapshot instead, "
+            "or use transcript-to-md to re-render it.",
             file=sys.stderr,
         )
         sys.exit(1)
