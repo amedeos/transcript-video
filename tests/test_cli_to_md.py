@@ -278,3 +278,14 @@ class TestIdentifySpeakersCli:
         # Auto-identified names appear in the Name column.
         assert "Mario" in out
         assert "Luca" in out
+
+
+def test_config_values_are_validated(tmp_path, monkeypatch, capsys):
+    """transcript-to-md shares the config checks of transcript-from-video."""
+    from transcript_video import cli_to_md
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "transcript-video.toml").write_text("paragraph_chars = 4.5\n")
+    with pytest.raises(SystemExit):
+        cli_to_md.main(["missing_transcript.json"])
+    assert "config 'paragraph_chars' must be an integer" in capsys.readouterr().err

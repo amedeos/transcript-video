@@ -184,20 +184,6 @@ def _build_pre_parser() -> argparse.ArgumentParser:
     return pre
 
 
-def _apply_config_defaults(parser: argparse.ArgumentParser, cli_defaults: dict) -> tuple[set[str], set[str]]:
-    known = {a.dest for a in parser._actions if a.dest != "help"}
-    applied: dict = {}
-    ignored: set[str] = set()
-    for key, value in cli_defaults.items():
-        if key in known:
-            applied[key] = value
-        else:
-            ignored.add(key)
-    if applied:
-        parser.set_defaults(**applied)
-    return set(applied.keys()), ignored
-
-
 def _resolve_speaker_stats(transcript: dict) -> dict:
     """Return ``stats.speakers`` from the JSON, recomputing on-the-fly if absent.
 
@@ -331,7 +317,7 @@ def main(argv: list[str] | None = None) -> None:
 
     parser = _build_parser()
     if cli_defaults:
-        _apply_config_defaults(parser, cli_defaults)
+        project_config.apply_to_parser(parser, cli_defaults)
 
     args = parser.parse_args(argv)
 

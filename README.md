@@ -480,7 +480,7 @@ Activate a profile with `--profile NAME`:
 transcript-from-video video.mp4 --profile meeting --md
 ```
 
-CLI flags always override the config. The config provides defaults; it never restricts.
+CLI flags always override the config. The config provides defaults; it never restricts. Each value is checked like the matching CLI flag: `beam_size = 5.5` or `device = "gpu"` stops with an error naming the key, instead of failing later in the pipeline.
 
 ## Running on CPU only
 

@@ -300,27 +300,6 @@ def _build_pre_parser() -> argparse.ArgumentParser:
     return pre
 
 
-def _apply_config_defaults(
-    parser: argparse.ArgumentParser, cli_defaults: dict
-) -> tuple[set[str], set[str]]:
-    """Filter the config's flat dict to keys recognized by the main parser.
-
-    Returns ``(applied, ignored)`` for diagnostics. Also calls
-    ``parser.set_defaults`` for the applied keys.
-    """
-    known = {a.dest for a in parser._actions if a.dest != "help"}
-    applied: dict = {}
-    ignored: set[str] = set()
-    for key, value in cli_defaults.items():
-        if key in known:
-            applied[key] = value
-        else:
-            ignored.add(key)
-    if applied:
-        parser.set_defaults(**applied)
-    return set(applied.keys()), ignored
-
-
 def _resolve_prompt(args: argparse.Namespace) -> str | None:
     if args.no_prompt:
         return ""
@@ -356,30 +335,18 @@ def main(argv: list[str] | None = None) -> None:
     applied: set[str] = set()
     ignored: set[str] = set()
     if cli_defaults:
-        applied, ignored = _apply_config_defaults(parser, cli_defaults)
+        applied, ignored = project_config.apply_to_parser(parser, cli_defaults)
 
     args = parser.parse_args(argv)
 
-    # argparse applies type=int only to CLI strings, not to config-file
-    # defaults, so a TOML `threads = 4.0` would arrive here as a float.
+    # Types and choices of config values were checked by apply_to_parser.
     # 0 means "auto", so `--threads 0` on the CLI can undo a config value.
     for flag, dest in (("--threads", "threads"), ("--batch-size", "batch_size")):
         value = getattr(args, dest)
-        if value is None:
-            continue
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            parser.error(
-                f"{flag} / config '{dest}' must be an integer >= 0, 0 = auto (got {value!r})"
-            )
+        if value is not None and value < 0:
+            parser.error(f"{flag} / config '{dest}' must be >= 0, 0 = auto (got {value!r})")
         if value == 0:
             setattr(args, dest, None)
-
-    # `choices` doesn't apply to config-file defaults: a TOML `device = "CUDA"`
-    # or "cuda:0" would otherwise slip past the explicit-cuda safety stop.
-    device = str(args.device).strip().lower()
-    if device not in ("auto", "cuda", "cpu"):
-        parser.error(f"--device / config 'device' must be auto, cuda or cpu (got {args.device!r})")
-    args.device = device
 
     setup_logging(quiet=args.quiet, verbose=args.verbose)
     silence_known_noisy_warnings()

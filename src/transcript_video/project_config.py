@@ -46,6 +46,8 @@ never restricts.
 
 from __future__ import annotations
 
+import argparse
+import datetime as _dt
 import sys
 from pathlib import Path
 from typing import Any
@@ -185,3 +187,96 @@ def resolve(
     data = load_config(path)
     cli_defaults, speaker_map = apply_profile(data, profile)
     return cli_defaults, speaker_map, path
+
+
+class ConfigValueError(ValueError):
+    """A config value that doesn't fit the CLI flag it sets."""
+
+
+def _coerce_scalar(action: argparse.Action, value: Any) -> Any:
+    """Convert one config value the way argparse converts a CLI string.
+
+    TOML already gives typed values, so the rules are: an ``int`` flag takes an
+    integer (or a numeric string), never a float or a boolean; a ``float``
+    flag takes any number but not a boolean; a plain string flag takes a
+    string, or a TOML date/time (written unquoted), rendered as ISO text.
+    """
+    conv = action.type
+    if isinstance(value, bool):
+        raise ConfigValueError("must not be a boolean")
+    if conv is int:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                pass
+        raise ConfigValueError("must be an integer")
+    if conv is float:
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                pass
+        raise ConfigValueError("must be a number")
+    if conv is None:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (_dt.date, _dt.time)):  # datetime is a date subclass
+            return value.isoformat()
+        raise ConfigValueError("must be a string")
+    return conv(value) if isinstance(value, str) else value
+
+
+def _coerce(action: argparse.Action, value: Any) -> Any:
+    """Validate and convert a config value for ``action``; raise ConfigValueError."""
+    if action.nargs == 0:  # store_true / store_false flags
+        if not isinstance(value, bool):
+            raise ConfigValueError("must be true or false")
+        return value
+    if isinstance(action, argparse._AppendAction):  # e.g. tags = ["a", "b"]
+        items = value if isinstance(value, list) else [value]
+        return [_coerce_scalar(action, item) for item in items]
+    if value is None:
+        return None
+    value = _coerce_scalar(action, value)
+    if action.choices is not None and value not in action.choices:
+        # Config files are forgiving about case ("CUDA" == "cuda"); the CLI isn't.
+        folded = {str(c).lower(): c for c in action.choices}
+        if isinstance(value, str) and value.lower() in folded:
+            return folded[value.lower()]
+        raise ConfigValueError(f"must be one of {', '.join(map(str, action.choices))}")
+    return value
+
+
+def apply_to_parser(
+    parser: argparse.ArgumentParser, cli_defaults: dict[str, Any]
+) -> tuple[set[str], set[str]]:
+    """Apply config values as parser defaults, validated like CLI input.
+
+    ``parser.set_defaults`` skips ``type=`` and ``choices`` for non-string
+    values, so without this a TOML ``beam_size = 5.5`` or ``device = "gpu"``
+    would reach the pipeline unchecked. Each key known to the parser is
+    converted and checked against its flag; an invalid value stops with a
+    parser error naming the key. Returns ``(applied, ignored)`` key sets;
+    ignored keys match no flag. CLI flags still win: they are parsed after
+    these defaults (invariant #7).
+    """
+    actions = {a.dest: a for a in parser._actions if a.dest != "help"}
+    applied: dict[str, Any] = {}
+    ignored: set[str] = set()
+    for key, value in cli_defaults.items():
+        action = actions.get(key)
+        if action is None:
+            ignored.add(key)
+            continue
+        try:
+            applied[key] = _coerce(action, value)
+        except (ConfigValueError, ValueError, TypeError) as e:
+            parser.error(f"config '{key}' {e} (got {value!r})")
+    if applied:
+        parser.set_defaults(**applied)
+    return set(applied), ignored

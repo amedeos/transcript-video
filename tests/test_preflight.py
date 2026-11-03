@@ -115,6 +115,13 @@ class TestCheckCuda:
 
     def test_run_preflight_passes_the_stages_that_run(self, monkeypatch, cfg, tmp_path):
         self._gpu(monkeypatch, ct2=False, torch=False)
+        # Only the device wiring is under test. Stub the other checks so the real
+        # whisperX (when installed) isn't imported: its cached whisperx.diarize
+        # would leak into the fake-module tests of check_whisperx_api.
+        for name in ("check_ffmpeg", "check_whisperx_api"):
+            monkeypatch.setattr(
+                f"transcript_video.preflight.{name}", lambda n=name: CheckResult(n, True, "stub")
+            )
         cfg.device = "cuda"
         cfg.resume_from_aligned = tmp_path / "x.aligned.json"
         cfg.diarization = DiarizationConfig(enabled=False)
