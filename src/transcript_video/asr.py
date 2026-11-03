@@ -33,6 +33,17 @@ _SELF_RESOLVING_COMPUTE_TYPES = frozenset({"default", "auto"})
 # Preferred CUDA compute types, best first (float16 first: reference-project parity).
 _CUDA_PREFERENCE = ("float16", "int8_float16", "int8", "float32")
 
+# ASR batch size: how many 30 s VAD chunks whisperX decodes at once. Each chunk
+# is padded to 30 s and decoded on its own, so the batch changes speed and
+# memory, never the transcript. ASR RAM grows with the batch: each chunk holds
+# its own encoder activations and cross-attention cache, about 0.65 GB per
+# chunk for large-v3 in float32 (extrapolated from measurements on tiny and small).
+# beam_size barely matters: the cross-attention cache is not copied per beam
+# hypothesis. On CUDA we keep whisperX's usual 16. On CPU, 4 keeps large-v3
+# float32 at roughly 10 GB peak, against about 18 GB at 16, at a modest speed cost.
+GPU_DEFAULT_BATCH_SIZE = 16
+CPU_DEFAULT_BATCH_SIZE = 4
+
 
 @functools.lru_cache(maxsize=1)
 def _probe_cuda() -> tuple[bool, str | None, frozenset[str]]:
@@ -309,6 +320,14 @@ def resolve_cpu_threads(requested: int | None) -> int:
     if requested is not None and requested > 0:
         return requested
     return max(1, available_cpu_count() - 1)
+
+
+def resolve_batch_size(requested: int | None, device: str) -> int:
+    """ASR batch size: the explicit value, else :data:`GPU_DEFAULT_BATCH_SIZE`
+    on CUDA and :data:`CPU_DEFAULT_BATCH_SIZE` on CPU."""
+    if requested is not None and requested > 0:
+        return requested
+    return GPU_DEFAULT_BATCH_SIZE if device == "cuda" else CPU_DEFAULT_BATCH_SIZE
 
 
 def apply_torch_threads(threads: int) -> None:

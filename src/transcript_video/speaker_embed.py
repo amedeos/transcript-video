@@ -78,6 +78,7 @@ def extract_cluster_embeddings(
     device: str = "cpu",
     model_name: str = DEFAULT_EMBEDDING_MODEL,
     min_segment_seconds: float = DEFAULT_MIN_SEGMENT_SECONDS,
+    audio: Any = None,
 ) -> dict[str, dict[str, Any]]:
     """Compute one aggregated embedding per diarized speaker label.
 
@@ -92,12 +93,15 @@ def extract_cluster_embeddings(
     "n_segments": int, "embedding_model": str}}``. Clusters for which no
     segment could be embedded are omitted from the result (with a warning).
 
+    ``audio`` is the already-decoded waveform (mono float32 at 16 kHz, as
+    returned by ``whisperx.load_audio``). Pass it when the caller has one, so the
+    file isn't decoded a second time; when ``None``, ``audio_path`` is decoded.
+
     Imports pyannote at call time; raises whatever the underlying library
     raises if pyannote is not installed or the model is inaccessible.
     """
     import numpy as np
     import torch
-    import whisperx
     from pyannote.audio import Inference, Model
 
     by_speaker: dict[str, list[tuple[float, float]]] = defaultdict(list)
@@ -132,9 +136,11 @@ def extract_cluster_embeddings(
     # and not subject to the torchaudio backend churn that has produced
     # segfaults in some pyannote.audio builds when passing audio in directly.
     # Always returns mono float32 at 16 kHz, which is what wespeaker expects.
-    audio_path = str(audio_path)
-    audio_array = whisperx.load_audio(audio_path)
-    waveform = torch.from_numpy(audio_array).unsqueeze(0)  # shape (1, n_samples)
+    if audio is None:
+        import whisperx
+
+        audio = whisperx.load_audio(str(audio_path))
+    waveform = torch.from_numpy(audio).unsqueeze(0)  # shape (1, n_samples)
     sample_rate = 16000
 
     # Inference is fed each segment as a ProtocolFile dict ({"waveform",

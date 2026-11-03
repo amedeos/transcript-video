@@ -564,6 +564,111 @@ class TestThreads:
         assert seen == {"asr": None}
 
 
+class TestBatchSize:
+    """ASR batch size: 16 on CUDA, 4 on CPU, explicit value wins."""
+
+    @pytest.fixture
+    def seen_batch(self, monkeypatch) -> dict[str, int]:
+        seen: dict[str, int] = {}
+
+        class FakeModel:
+            def transcribe(self, audio, batch_size, **kwargs):
+                seen["batch_size"] = batch_size
+                return {"language": "it", "segments": [{"start": 0.0, "end": 1.0, "text": "x"}]}
+
+        monkeypatch.setattr(
+            pipeline_mod.asr_mod, "load_whisperx_model", lambda *a, **kw: FakeModel()
+        )
+        return seen
+
+    @staticmethod
+    def _on_cpu(monkeypatch):
+        monkeypatch.setattr(
+            pipeline_mod.asr_mod, "resolve_device_and_compute", lambda d, c: ("cpu", "float32")
+        )
+        monkeypatch.setattr(pipeline_mod.asr_mod, "torch_cuda_available", lambda: False)
+
+    def test_cuda_default_is_16(self, stub_pipeline, seen_batch, fake_input):
+        config = _config(fake_input, write_md=False)
+        config.beam_size = 10
+        pipeline_mod.run_pipeline(config)
+        assert seen_batch == {"batch_size": 16}
+
+    def test_cpu_default_is_4(self, stub_pipeline, seen_batch, fake_input, monkeypatch):
+        self._on_cpu(monkeypatch)
+        config = _config(fake_input, write_md=False)
+        config.beam_size = 10
+        pipeline_mod.run_pipeline(config)
+        assert seen_batch == {"batch_size": 4}
+
+    def test_explicit_batch_size_wins_on_cpu(self, stub_pipeline, seen_batch, fake_input, monkeypatch):
+        self._on_cpu(monkeypatch)
+        config = _config(fake_input, write_md=False)
+        config.beam_size = 10
+        config.batch_size = 3
+        pipeline_mod.run_pipeline(config)
+        assert seen_batch == {"batch_size": 3}
+
+
+class TestMemoryLog:
+    def test_reads_rss_and_peak_from_proc_status(self, tmp_path):
+        status = tmp_path / "status"
+        status.write_text("Name:\tpython\nVmHWM:\t 3145728 kB\nVmRSS:\t 1048576 kB\n")
+        assert pipeline_mod._read_memory_gb(status) == (1.0, 3.0)
+
+    def test_missing_status_file_is_none(self, tmp_path):
+        assert pipeline_mod._read_memory_gb(tmp_path / "nope") is None
+
+
+class TestAudioDecodedOnce:
+    """The waveform decoded for ASR feeds diarization and embeddings too."""
+
+    @pytest.fixture
+    def seen(self, monkeypatch, fake_audio) -> dict:
+        seen: dict = {"loads": 0}
+
+        def _load(_path):
+            seen["loads"] += 1
+            return fake_audio
+
+        def _diarize(aligned, audio, **kwargs):
+            seen["diarize_audio"] = audio
+            return {"segments": aligned["segments"], "word_segments": []}
+
+        def _extract(audio_path, segments, **kwargs):
+            seen["embed_audio"] = kwargs.get("audio")
+            return {}
+
+        monkeypatch.setattr(pipeline_mod.asr_mod, "load_audio", _load)
+        monkeypatch.setattr(pipeline_mod.diarize_mod, "diarize_and_assign", _diarize)
+        monkeypatch.setattr(
+            pipeline_mod.speaker_embed_mod, "extract_cluster_embeddings", _extract
+        )
+        return seen
+
+    def test_full_run_decodes_once(self, stub_pipeline, seen, fake_input, fake_audio):
+        pipeline_mod.run_pipeline(_config(fake_input, write_md=False))
+        assert seen["loads"] == 1
+        assert seen["diarize_audio"] is fake_audio
+        assert seen["embed_audio"] is fake_audio
+
+    def test_resume_decodes_once_and_reuses_for_embeddings(
+        self, stub_pipeline, seen, fake_input, fake_audio, tmp_path
+    ):
+        # First run writes the aligned snapshot; reset the counter, then resume.
+        pipeline_mod.run_pipeline(_config(fake_input, write_md=False))
+        snapshot = pipeline_mod._resolve_output_paths(_config(fake_input))["aligned"]
+        seen["loads"] = 0
+
+        config = _config(fake_input, write_md=False)
+        config.resume_from_aligned = snapshot
+        pipeline_mod.run_pipeline(config)
+
+        assert seen["loads"] == 1
+        assert seen["diarize_audio"] is fake_audio
+        assert seen["embed_audio"] is fake_audio
+
+
 class TestPayloadConstruction:
     def test_aligned_payload_no_speakers(self, fake_input):
         cfg = _config(fake_input)

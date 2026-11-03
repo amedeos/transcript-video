@@ -45,6 +45,31 @@ KNOWN_MEDIA_EXTENSIONS = frozenset({
 })
 
 
+def _read_memory_gb(status_path: Path = Path("/proc/self/status")) -> tuple[float, float] | None:
+    """``(current_rss, peak_rss)`` of this process in GB, or ``None`` off Linux."""
+    try:
+        text = status_path.read_text()
+    except OSError:
+        return None
+    values: dict[str, float] = {}
+    for line in text.splitlines():
+        key, _, rest = line.partition(":")
+        if key in ("VmRSS", "VmHWM"):
+            fields = rest.split()
+            if fields and fields[0].isdigit():
+                values[key] = int(fields[0]) / (1024 * 1024)  # kB -> GB
+    if "VmRSS" not in values or "VmHWM" not in values:
+        return None
+    return values["VmRSS"], values["VmHWM"]
+
+
+def _log_memory(label: str) -> None:
+    """Log RAM in use and the peak so far, to show which stage needs the most memory."""
+    mem = _read_memory_gb()
+    if mem is not None:
+        logger.info("RAM %s: %.1f GB (peak %.1f GB)", label, mem[0], mem[1])
+
+
 def _resolve_output_paths(config: RunConfig) -> dict[str, Path]:
     input_path = config.input_file.resolve()
     output_dir = config.output.output_dir.resolve() if config.output.output_dir else input_path.parent
@@ -241,11 +266,13 @@ def _run_asr_and_align(
     paths: dict[str, Path],
     devices: _Devices,
     threads: int | None = None,
-) -> dict[str, Any]:
-    """Run model load → ASR → alignment, returning the aligned-stage payload.
+) -> tuple[dict[str, Any], Any]:
+    """Run model load → ASR → alignment; return ``(aligned_payload, audio)``.
 
     ASR runs on ``devices.asr`` (ctranslate2) and alignment on
     ``devices.torch``. Both were resolved once by :func:`_resolve_devices`.
+    The decoded audio is returned so diarization can reuse it instead of
+    decoding the file again.
 
     Side effect: when diarization is enabled, persists the aligned payload to
     ``paths['aligned']`` so a downstream failure doesn't lose the work.
@@ -261,6 +288,9 @@ def _run_asr_and_align(
     model = asr_mod.load_whisperx_model(
         config.model, device, compute_type, config.beam_size, threads=threads
     )
+    _log_memory("after model load")
+    batch_size = asr_mod.resolve_batch_size(config.batch_size, device)
+    batch_display = str(batch_size) if config.batch_size else f"{batch_size} (auto: {device})"
 
     transcribe_kwargs = asr_mod.build_transcribe_kwargs(
         language=config.language,
@@ -277,6 +307,7 @@ def _run_asr_and_align(
 
     logger.info("Starting transcription of: %s", input_path.name)
     logger.info("  beam_size:       %s", config.beam_size)
+    logger.info("  batch_size:      %s", batch_display)
     logger.info("  language:        %s", language_display)
     logger.info("  initial prompt:  %s", prompt_display)
     logger.info("  hotwords:        %s", hotwords_display)
@@ -286,11 +317,13 @@ def _run_asr_and_align(
     audio = asr_mod.load_audio(input_path)
 
     start_time = datetime.now()
-    asr_result = model.transcribe(audio, batch_size=16, **transcribe_kwargs)
+    asr_result = model.transcribe(audio, batch_size=batch_size, **transcribe_kwargs)
+    _log_memory("after ASR")
     # Free the ASR model before alignment/diarization load their own models:
     # large-v3 in float32 on CPU holds several GB of RAM.
     del model
     gc.collect()
+    _log_memory("after freeing the ASR model")
 
     detected_language = asr_result.get("language") or config.language or "und"
     raw_segments: list[dict[str, Any]] = list(asr_result.get("segments", []))
@@ -301,6 +334,10 @@ def _run_asr_and_align(
 
     logger.info("Aligning to word level...")
     aligned = asr_mod.align_segments(raw_segments, detected_language, audio, devices.torch)
+    # The alignment model was local to align_segments: collect it before
+    # diarization loads pyannote.
+    gc.collect()
+    _log_memory("after alignment")
     aligned_segments = [_normalize_segment(s) for s in aligned.get("segments", [])]
     align_time = datetime.now()
     align_seconds = (align_time - start_time).total_seconds()
@@ -323,7 +360,7 @@ def _run_asr_and_align(
         write_json(payload, paths["aligned"])
         logger.info("Aligned snapshot saved: %s", paths["aligned"])
 
-    return payload
+    return payload, audio
 
 
 def _load_aligned_payload(path: Path) -> dict[str, Any]:
@@ -346,7 +383,9 @@ def _load_aligned_payload(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _diarize_payload(payload: dict[str, Any], config: RunConfig, *, device: str) -> dict[str, Any]:
+def _diarize_payload(
+    payload: dict[str, Any], config: RunConfig, *, device: str, audio: Any = None
+) -> dict[str, Any]:
     """Run diarization on an aligned payload and return the complete payload.
 
     Diarization and embeddings run on ``device``: the torch device resolved
@@ -354,12 +393,16 @@ def _diarize_payload(payload: dict[str, Any], config: RunConfig, *, device: str)
     machine can be resumed on a CPU-only one, and vice versa.
     ``parameters.device`` in the JSON keeps the device the ASR ran on (read
     from the payload), so it stays consistent with ``compute_type``.
+
+    ``audio`` is the waveform the ASR already decoded; ``None`` (on resume)
+    decodes the input file here.
     """
     input_path = config.input_file.resolve()
     asr_device = payload["parameters"].get("device") or "cpu"
 
     logger.info("Running speaker diarization (pyannote)...")
-    audio = asr_mod.load_audio(input_path)
+    if audio is None:
+        audio = asr_mod.load_audio(input_path)
     aligned_for_whisperx = {
         "segments": payload["segments"],
         "word_segments": [],
@@ -376,6 +419,8 @@ def _diarize_payload(payload: dict[str, Any], config: RunConfig, *, device: str)
         model_name=config.diarization.model_name,
     )
     diarized_segments = [_normalize_segment(s) for s in diarized.get("segments", [])]
+    gc.collect()
+    _log_memory("after diarization")
 
     # Best-effort cluster-embedding extraction. Failure is logged and the
     # pipeline continues with an empty `speaker_clusters`; the transcript is
@@ -390,10 +435,12 @@ def _diarize_payload(payload: dict[str, Any], config: RunConfig, *, device: str)
                 diarized_segments,
                 hf_token=token,
                 device=device,
+                audio=audio,
             )
             logger.info(
                 "Cached embeddings for %d cluster(s).", len(speaker_clusters)
             )
+            _log_memory("after speaker embeddings")
         except Exception as e:
             logger.warning(
                 "Speaker embedding extraction failed: %s. "
@@ -547,17 +594,20 @@ def run_pipeline(config: RunConfig) -> dict[str, Path]:
     devices = _resolve_devices(config)
     asr_threads = _configure_threads(config, devices)
 
+    audio = None
     if config.resume_from_aligned:
         logger.info("Resuming from aligned snapshot: %s", config.resume_from_aligned)
         aligned_payload = _load_aligned_payload(config.resume_from_aligned)
     else:
-        aligned_payload = _run_asr_and_align(
+        aligned_payload, audio = _run_asr_and_align(
             config, paths=paths, devices=devices, threads=asr_threads
         )
 
     if config.diarization.enabled:
         try:
-            final_payload = _diarize_payload(aligned_payload, config, device=devices.torch)
+            final_payload = _diarize_payload(
+                aligned_payload, config, device=devices.torch, audio=audio
+            )
         except SystemExit:
             # Pre-flight or diarize printed an error; the aligned snapshot is still
             # on disk so the user can retry with --resume-from-aligned.
@@ -571,6 +621,7 @@ def run_pipeline(config: RunConfig) -> dict[str, Path]:
         # No diarization: promote the aligned payload to "complete" stage as-is.
         final_payload = dict(aligned_payload)
         final_payload["stage"] = STAGE_COMPLETE
+    audio = None  # no stage needs the waveform past this point
 
     written = _write_outputs(final_payload, config, paths)
 

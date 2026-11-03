@@ -221,6 +221,21 @@ class TestResolveDevice:
         assert "alignment/diarization (torch)" in capsys.readouterr().err
 
 
+class TestBatchSize:
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_explicit_value_wins(self, device):
+        assert asr.resolve_batch_size(3, device) == 3
+
+    def test_cuda_default(self):
+        assert asr.resolve_batch_size(None, "cuda") == 16
+
+    def test_cpu_default(self):
+        assert asr.resolve_batch_size(None, "cpu") == 4
+
+    def test_non_positive_means_auto(self):
+        assert asr.resolve_batch_size(0, "cpu") == 4
+
+
 class TestThreads:
     def test_explicit_value_wins(self, monkeypatch):
         monkeypatch.setattr(asr, "available_cpu_count", lambda: 8)

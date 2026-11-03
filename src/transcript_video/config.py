@@ -54,6 +54,7 @@ class RunConfig:
     device: str | None = None  # ``cuda`` / ``cpu`` / ``None`` = auto.
     compute_type: str | None = None  # Override (e.g. ``int8_float16``); ``None`` = auto.
     threads: int | None = None  # CPU threads; ``None`` = logical CPUs - 1.
+    batch_size: int | None = None  # ASR batch; ``None`` = 16 on CUDA, 4 on CPU.
     language: str | None = None  # ``None`` = autodetect.
 
     initial_prompt: str | None = None  # ``None`` = unset, ``""`` = explicitly disabled.

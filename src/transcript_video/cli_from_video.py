@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from . import project_config
+from .asr import CPU_DEFAULT_BATCH_SIZE, GPU_DEFAULT_BATCH_SIZE
 from .config import (
     DiarizationConfig,
     FrontmatterConfig,
@@ -79,7 +80,18 @@ Examples:
         type=int,
         default=None,
         metavar="N",
-        help="CPU threads for ASR, alignment and diarization (default: logical CPUs - 1).",
+        help="CPU threads for ASR, alignment and diarization (default or 0: logical CPUs - 1).",
+    )
+    model_group.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "ASR chunks decoded at once. Changes speed and memory, not the transcript. "
+            f"Default (or 0): {GPU_DEFAULT_BATCH_SIZE} on CUDA, {CPU_DEFAULT_BATCH_SIZE} on CPU. "
+            "Lower it if the run is killed for lack of memory."
+        ),
     )
 
     parser.add_argument(
@@ -349,10 +361,17 @@ def main(argv: list[str] | None = None) -> None:
 
     # argparse applies type=int only to CLI strings, not to config-file
     # defaults, so a TOML `threads = 4.0` would arrive here as a float.
-    if args.threads is not None and (
-        isinstance(args.threads, bool) or not isinstance(args.threads, int) or args.threads < 1
-    ):
-        parser.error(f"--threads / config 'threads' must be an integer >= 1 (got {args.threads!r})")
+    # 0 means "auto", so `--threads 0` on the CLI can undo a config value.
+    for flag, dest in (("--threads", "threads"), ("--batch-size", "batch_size")):
+        value = getattr(args, dest)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            parser.error(
+                f"{flag} / config '{dest}' must be an integer >= 0, 0 = auto (got {value!r})"
+            )
+        if value == 0:
+            setattr(args, dest, None)
 
     setup_logging(quiet=args.quiet, verbose=args.verbose)
     silence_known_noisy_warnings()
@@ -400,6 +419,7 @@ def main(argv: list[str] | None = None) -> None:
         device=None if args.device == "auto" else args.device,
         compute_type=args.compute_type,
         threads=args.threads,
+        batch_size=args.batch_size,
         language=args.language,
         initial_prompt=_resolve_prompt(args),
         hotwords=_resolve_hotwords(args),
