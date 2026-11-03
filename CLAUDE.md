@@ -156,7 +156,8 @@ The auto-id default threshold `speaker_db.DEFAULT_THRESHOLD = 0.65` is the same 
 
 These optimizations are intentionally preserved verbatim from `trascrivi.py` (only translated to English) and their behavior must not drift:
 
-- **Anti-loop** (`--anti-loop`): sets exactly `condition_on_previous_text=False`, `compression_ratio_threshold=2.0`, `no_speech_threshold=0.5`. See `asr.build_transcribe_kwargs`.
+- **Anti-loop** (`--anti-loop`): sets exactly `condition_on_previous_text=False`, `compression_ratio_threshold=2.0`, `no_speech_threshold=0.5`. See `asr.build_asr_options`. Caveat: whisperX's batched decoding (3.8) reads none of the three. Each 30 s VAD chunk is decoded on its own, with no previous-text conditioning or temperature fallback, so the flag is kept for parity but has no effect today.
+- **Decoding options go in at model load, not to `transcribe()`.** whisperX's batched `FasterWhisperPipeline.transcribe` accepts only audio / batch size / language / task / chunk size / progress arguments. Prompt, hotwords, beam size and the anti-loop values are `asr_options` of `whisperx.load_model` (`asr.build_asr_options` → `asr.load_whisperx_model`). Passing them to `transcribe()` raised `TypeError` on every `--prompt` / `--hotwords` / `--anti-loop` run. The test stub in `test_pipeline_orchestration.py` mirrors the real `transcribe` signature, so the bug can't come back silently.
 - **Initial prompt** (mutex group): `--prompt` / `--prompt-file` / `--no-prompt`. `None` means "unset", `""` means "explicitly disabled".
 - **Hotwords** (mutex group): same tri-state convention as the prompt group.
 - **CUDA detection** (`asr.check_cuda_available`): probes `ctranslate2.get_supported_compute_types("cuda")` and prefers `float16`. Same logic as `trascrivi.py:15-22`.

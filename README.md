@@ -148,7 +148,7 @@ transcript-from-video lecture.mp4 --no-diarize --txt --srt
 
 | Flag | Description |
 |------|-------------|
-| `--anti-loop` | `condition_on_previous_text=False`, `compression_ratio_threshold=2.0`, `no_speech_threshold=0.5` — apply when you observe Whisper's cyclic hallucinations |
+| `--anti-loop` | `condition_on_previous_text=False`, `compression_ratio_threshold=2.0`, `no_speech_threshold=0.5`, from the reference project. With whisperX's batched decoding these currently have no effect: each 30 s chunk is already decoded on its own, without conditioning on the previous text |
 
 **Verbosity**
 

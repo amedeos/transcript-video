@@ -284,6 +284,47 @@ class TestPlanDevices:
         _plan("cuda", run_asr=False, run_torch=False)
 
 
+class TestBuildAsrOptions:
+    def test_beam_only_by_default(self):
+        opts = asr.build_asr_options(beam_size=5, initial_prompt=None, hotwords=None, anti_loop=False)
+        assert opts == {"beam_size": 5}
+
+    def test_anti_loop_parity_values(self):
+        # Reference-project parity: exactly these three values.
+        opts = asr.build_asr_options(beam_size=5, initial_prompt=None, hotwords=None, anti_loop=True)
+        assert opts == {
+            "beam_size": 5,
+            "condition_on_previous_text": False,
+            "compression_ratio_threshold": 2.0,
+            "no_speech_threshold": 0.5,
+        }
+
+    def test_prompt_and_hotwords(self):
+        opts = asr.build_asr_options(
+            beam_size=10, initial_prompt="Riunione.", hotwords="OpenShift", anti_loop=False
+        )
+        assert opts == {"beam_size": 10, "initial_prompt": "Riunione.", "hotwords": "OpenShift"}
+
+    @pytest.mark.parametrize("empty", [None, ""])
+    def test_empty_prompt_and_hotwords_are_omitted(self, empty):
+        opts = asr.build_asr_options(beam_size=5, initial_prompt=empty, hotwords=empty, anti_loop=False)
+        assert opts == {"beam_size": 5}
+
+    def test_options_reach_whisperx_load_model(self, monkeypatch):
+        seen: dict = {}
+        fake = types.ModuleType("whisperx")
+
+        def load_model(name, device, compute_type="float16", asr_options=None):
+            seen.update(asr_options)
+            return "model"
+
+        fake.load_model = load_model
+        monkeypatch.setitem(sys.modules, "whisperx", fake)
+        opts = {"beam_size": 5, "initial_prompt": "Riunione."}
+        asr.load_whisperx_model("large-v3", "cpu", "float32", opts)
+        assert seen == opts
+
+
 class TestVadDevice:
     """whisperX builds its pyannote VAD on the ASR device unless we pass one."""
 
@@ -302,12 +343,12 @@ class TestVadDevice:
         return calls
 
     def test_vad_built_on_cpu_when_it_differs(self, fake_whisperx):
-        asr.load_whisperx_model("large-v3", "cuda", "float16", 5, vad_device="cpu")
+        asr.load_whisperx_model("large-v3", "cuda", "float16", {"beam_size": 5}, vad_device="cpu")
         assert fake_whisperx == {"device": "cuda", "vad_model": "vad@cpu"}
 
     @pytest.mark.parametrize("vad_device", [None, "cuda"])
     def test_whisperx_default_vad_otherwise(self, fake_whisperx, vad_device):
-        asr.load_whisperx_model("large-v3", "cuda", "float16", 5, vad_device=vad_device)
+        asr.load_whisperx_model("large-v3", "cuda", "float16", {"beam_size": 5}, vad_device=vad_device)
         assert fake_whisperx == {"device": "cuda", "vad_model": None}
 
     def test_cpu_vad_unsupported_without_whisperx(self, monkeypatch):
@@ -449,7 +490,7 @@ class TestLoadWhisperxModelThreads:
             return "model"
 
         self._install_fake_whisperx(monkeypatch, load_model)
-        assert asr.load_whisperx_model("large-v3", "cpu", "float32", 5, threads=7) == "model"
+        assert asr.load_whisperx_model("large-v3", "cpu", "float32", {"beam_size": 5}, threads=7) == "model"
         assert calls == {"device": "cpu", "compute_type": "float32", "threads": 7}
 
     def test_threads_forwarded_through_lazy_wrapper(self, monkeypatch):
@@ -468,7 +509,7 @@ class TestLoadWhisperxModelThreads:
         monkeypatch.setitem(sys.modules, "whisperx", fake)
         monkeypatch.setitem(sys.modules, "whisperx.asr", fake_asr)
 
-        assert asr.load_whisperx_model("large-v3", "cpu", "float32", 5, threads=7) == "model"
+        assert asr.load_whisperx_model("large-v3", "cpu", "float32", {"beam_size": 5}, threads=7) == "model"
         assert calls == {"threads": 7}
 
     def test_threads_omitted_when_signature_lacks_it(self, monkeypatch):
@@ -479,5 +520,5 @@ class TestLoadWhisperxModelThreads:
             return "model"
 
         self._install_fake_whisperx(monkeypatch, load_model)
-        assert asr.load_whisperx_model("large-v3", "cpu", "float32", 5, threads=7) == "model"
+        assert asr.load_whisperx_model("large-v3", "cpu", "float32", {"beam_size": 5}, threads=7) == "model"
         assert calls == {"device": "cpu", "compute_type": "float32"}

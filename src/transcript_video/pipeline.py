@@ -275,20 +275,19 @@ def _run_asr_and_align(
         logger.warning("Running on CPU (compute_type=%s, slower).", compute_type)
 
     logger.info("Loading whisperX model '%s'...", config.model)
+    asr_options = asr_mod.build_asr_options(
+        beam_size=config.beam_size,
+        initial_prompt=config.initial_prompt,
+        hotwords=config.hotwords,
+        anti_loop=config.anti_loop,
+    )
     model = asr_mod.load_whisperx_model(
-        config.model, device, compute_type, config.beam_size, threads=threads,
+        config.model, device, compute_type, asr_options, threads=threads,
         vad_device=devices.vad,
     )
     _log_memory("after model load")
     batch_size = asr_mod.resolve_batch_size(config.batch_size, device)
     batch_display = str(batch_size) if config.batch_size else f"{batch_size} (auto: {device})"
-
-    transcribe_kwargs = asr_mod.build_transcribe_kwargs(
-        language=config.language,
-        initial_prompt=config.initial_prompt,
-        hotwords=config.hotwords,
-        anti_loop=config.anti_loop,
-    )
 
     prompt_display = "(none)" if not config.initial_prompt else (
         config.initial_prompt if len(config.initial_prompt) <= 80 else config.initial_prompt[:80] + "..."
@@ -308,7 +307,9 @@ def _run_asr_and_align(
     audio = asr_mod.load_audio(input_path)
 
     start_time = datetime.now()
-    asr_result = model.transcribe(audio, batch_size=batch_size, **transcribe_kwargs)
+    # Decoding options went in at load time (asr_options): whisperX's batched
+    # transcribe() only takes the audio, batch size and language.
+    asr_result = model.transcribe(audio, batch_size=batch_size, language=config.language)
     _log_memory("after ASR")
     # Free the ASR model before alignment/diarization load their own models:
     # large-v3 in float32 on CPU holds several GB of RAM.

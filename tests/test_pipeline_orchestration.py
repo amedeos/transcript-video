@@ -46,7 +46,14 @@ def stub_pipeline(monkeypatch, fake_audio):
     """Stub all torch/whisperX boundaries used by run_pipeline."""
 
     class FakeModel:
-        def transcribe(self, audio, batch_size, **kwargs):
+        # Same signature as whisperX 3.8's FasterWhisperPipeline.transcribe:
+        # decoding options (prompt, hotwords, anti-loop) are NOT accepted here,
+        # so passing one fails the test as it fails the real run.
+        def transcribe(
+            self, audio, batch_size=None, num_workers=0, language=None, task=None,
+            chunk_size=30, print_progress=False, combined_progress=False,
+            verbose=False, progress_callback=None,
+        ):
             return {
                 "language": "it",
                 "language_probability": 0.95,
@@ -589,6 +596,35 @@ class TestThreads:
         pipeline_mod.run_pipeline(_config(fake_input, write_md=False))
 
         assert seen == {"asr": None}
+
+
+class TestDecodingOptions:
+    """Prompt, hotwords and anti-loop go in at model load, never to transcribe()."""
+
+    def test_options_go_to_load_model(self, stub_pipeline, fake_input, monkeypatch):
+        seen: dict = {}
+        real_load = pipeline_mod.asr_mod.load_whisperx_model
+
+        def _load(name, device, compute_type, asr_options, **kw):
+            seen.update(asr_options)
+            return real_load(name, device, compute_type, asr_options, **kw)
+
+        monkeypatch.setattr(pipeline_mod.asr_mod, "load_whisperx_model", _load)
+        config = _config(fake_input, write_md=False)
+        config.initial_prompt = "Riunione di lavoro."
+        config.hotwords = "OpenShift"
+        config.anti_loop = True
+        config.beam_size = 10
+        pipeline_mod.run_pipeline(config)  # the strict FakeModel.transcribe must not raise
+
+        assert seen == {
+            "beam_size": 10,
+            "initial_prompt": "Riunione di lavoro.",
+            "hotwords": "OpenShift",
+            "condition_on_previous_text": False,
+            "compression_ratio_threshold": 2.0,
+            "no_speech_threshold": 0.5,
+        }
 
 
 class TestThreadPolicyEdges:

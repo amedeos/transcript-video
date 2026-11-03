@@ -390,34 +390,39 @@ def apply_torch_threads(threads: int) -> None:
     torch.set_num_threads(threads)
 
 
-def build_transcribe_kwargs(
+def build_asr_options(
     *,
-    language: str | None,
+    beam_size: int,
     initial_prompt: str | None,
     hotwords: str | None,
     anti_loop: bool,
 ) -> dict[str, Any]:
-    """Build the kwargs dict passed to whisperX's ``model.transcribe``.
+    """Decoding options for whisperX's ``load_model(asr_options=...)``.
 
-    - ``language=None`` → autodetect (whisperX default).
-    - ``initial_prompt`` / ``hotwords``: pass-through. ``None`` and ``""`` both
-      omit the kwarg; an empty string explicitly disables it (we still skip the
-      kwarg since an empty value would do nothing useful).
-    - ``anti_loop=True`` applies the same three mitigations as the reference
-      project's ``--anti-loop`` flag.
+    whisperX's batched ``transcribe()`` takes no decoding options (only audio,
+    batch size, language, task, ...). Prompt, hotwords and the anti-loop
+    thresholds must be set when the model is loaded, where they override
+    whisperX's ``default_asr_options``. Passing them to ``transcribe()`` raised
+    ``TypeError``.
+
+    - ``initial_prompt`` / ``hotwords``: ``None`` and ``""`` both keep
+      whisperX's default (none).
+    - ``anti_loop=True`` sets the same three values as the reference project's
+      ``--anti-loop``. whisperX's batched decoding (3.8) reads none of them:
+      each 30 s chunk is decoded on its own, without previous-text
+      conditioning or temperature fallback. They are kept for parity and in
+      case whisperX starts honoring them.
     """
-    kwargs: dict[str, Any] = {}
-    if language:
-        kwargs["language"] = language
+    options: dict[str, Any] = {"beam_size": beam_size}
     if anti_loop:
-        kwargs["condition_on_previous_text"] = False
-        kwargs["compression_ratio_threshold"] = 2.0
-        kwargs["no_speech_threshold"] = 0.5
+        options["condition_on_previous_text"] = False
+        options["compression_ratio_threshold"] = 2.0
+        options["no_speech_threshold"] = 0.5
     if initial_prompt:
-        kwargs["initial_prompt"] = initial_prompt
+        options["initial_prompt"] = initial_prompt
     if hotwords:
-        kwargs["hotwords"] = hotwords
-    return kwargs
+        options["hotwords"] = hotwords
+    return options
 
 
 # whisperX's default VAD onset (``default_vad_options`` in ``whisperx.asr.load_model``).
@@ -454,11 +459,14 @@ def load_whisperx_model(
     model_name: str,
     device: str,
     compute_type: str,
-    beam_size: int,
+    asr_options: dict[str, Any],
     threads: int | None = None,
     vad_device: str | None = None,
 ):
     """Load a whisperX model. Imports whisperx lazily so failures are clearer.
+
+    ``asr_options`` come from :func:`build_asr_options` (beam size, prompt,
+    hotwords, anti-loop thresholds).
 
     ``threads`` sets ctranslate2's CPU thread count. It is forwarded only when
     the installed whisperX's ``load_model`` accepts a ``threads`` kwarg.
@@ -480,7 +488,7 @@ def load_whisperx_model(
     kwargs: dict[str, Any] = {
         "device": device,
         "compute_type": compute_type,
-        "asr_options": {"beam_size": beam_size},
+        "asr_options": dict(asr_options),
     }
     if threads is not None and _load_model_accepts(whisperx, "threads"):
         kwargs["threads"] = threads
