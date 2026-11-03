@@ -71,3 +71,13 @@ class RunConfig:
     # When set, ASR + alignment are skipped and the pipeline jumps straight to
     # diarization (if enabled) and the final outputs.
     resume_from_aligned: Path | None = None
+
+    @property
+    def runs_asr(self) -> bool:
+        """ASR + alignment run (not a resume)."""
+        return self.resume_from_aligned is None
+
+    @property
+    def runs_torch(self) -> bool:
+        """A torch stage runs: VAD + alignment with the ASR, or diarization."""
+        return self.runs_asr or self.diarization.enabled

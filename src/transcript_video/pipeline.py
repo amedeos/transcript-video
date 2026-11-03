@@ -17,7 +17,7 @@ from __future__ import annotations
 import gc
 import logging
 import sys
-from dataclasses import dataclass
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -203,60 +203,50 @@ def _build_payload(
     }
 
 
-@dataclass(frozen=True)
-class _Devices:
-    """Devices for one run, resolved once so the stages can't disagree.
+def _resolve_devices(config: RunConfig) -> asr_mod.DevicePlan:
+    """Resolve the devices for the stages that will run, before any heavy work.
 
-    ``asr`` / ``compute_type`` are ``None`` when resuming (no ASR runs).
+    The rules live in :func:`asr.plan_devices`, shared with the pre-flight
+    check. An explicit ``--device cuda`` that this machine can't honor stops
+    the run here, in seconds instead of after hours on CPU, even with
+    ``--no-check``. The returned plan also carries the ASR compute type.
     """
-
-    asr: str | None
-    compute_type: str | None
-    torch: str
-
-
-def _resolve_devices(config: RunConfig) -> _Devices:
-    """Resolve the ASR (ctranslate2) and torch devices, before any heavy work.
-
-    Each library gets the GPU when *it* can use one. With ``--device auto`` a
-    library without CUDA runs on CPU. With an explicit ``--device cuda``,
-    either library lacking CUDA stops the run here (see
-    :func:`asr.resolve_device`), in seconds instead of after hours on CPU.
-    """
-    asr_device = compute_type = None
-    if not config.resume_from_aligned:
-        asr_device, compute_type = asr_mod.resolve_device_and_compute(
-            config.device, config.compute_type
-        )
-    torch_device = asr_mod.resolve_device(config.device, asr_mod.BACKEND_TORCH)
-    if asr_device is not None and asr_device != torch_device:
-        logger.warning(
-            "Mixed devices: ASR on %s, alignment/diarization on %s "
-            "(only one of ctranslate2 / torch can use CUDA on this machine).",
-            asr_device,
-            torch_device,
-        )
-    return _Devices(asr=asr_device, compute_type=compute_type, torch=torch_device)
+    plan = asr_mod.plan_devices(
+        config.device, run_asr=config.runs_asr, run_torch=config.runs_torch
+    )
+    if plan.error:
+        print(f"Error: {plan.error}", file=sys.stderr)
+        sys.exit(1)
+    for note in plan.notes:
+        logger.warning(note)
+    if plan.asr:
+        plan = replace(plan, compute_type=asr_mod.resolve_compute_type(plan.asr, config.compute_type))
+    return plan
 
 
-def _configure_threads(config: RunConfig, devices: _Devices) -> int | None:
+def _configure_threads(config: RunConfig, devices: asr_mod.DevicePlan) -> int | None:
     """Apply the CPU thread policy; return the thread count for ctranslate2 (or ``None``).
 
-    An explicit ``--threads`` applies everywhere. Otherwise the default
-    (CPUs - 1) is applied only to the libraries running on CPU. A library on
-    the GPU keeps its own default; torch, for instance, defaults to the
-    physical core count.
+    An explicit ``--threads`` applies to every library that runs a stage.
+    Otherwise the default (CPUs - 1) is applied only to the libraries running
+    on CPU: ctranslate2 when the ASR does, torch when any torch work does (VAD,
+    alignment, diarization). A library on the GPU keeps its own default;
+    torch, for instance, defaults to the physical core count. A library with
+    no stage to run is left alone.
     """
-    explicit = config.threads is not None
+    explicit = config.threads is not None and config.threads > 0
     threads = asr_mod.resolve_cpu_threads(config.threads)
-    asr_threads = threads if explicit or devices.asr == "cpu" else None
-    torch_threads = threads if explicit or devices.torch == "cpu" else None
+    torch_runs = devices.torch is not None or devices.vad is not None
+    asr_threads = (
+        threads if devices.asr is not None and (explicit or devices.asr == "cpu") else None
+    )
+    torch_threads = threads if torch_runs and (explicit or devices.torch_on_cpu) else None
     if torch_threads is not None:
         asr_mod.apply_torch_threads(torch_threads)
-    if asr_threads is None and torch_threads is None:
-        logger.info("CPU threads: library defaults (GPU run; --threads N to override).")
-    else:
+    if asr_threads is not None or torch_threads is not None:
         logger.info("CPU threads: %d", threads)
+    elif devices.uses_device:
+        logger.info("CPU threads: library defaults (GPU run; --threads N to override).")
     return asr_threads
 
 
@@ -264,7 +254,7 @@ def _run_asr_and_align(
     config: RunConfig,
     *,
     paths: dict[str, Path],
-    devices: _Devices,
+    devices: asr_mod.DevicePlan,
     threads: int | None = None,
 ) -> tuple[dict[str, Any], Any]:
     """Run model load → ASR → alignment; return ``(aligned_payload, audio)``.
@@ -286,7 +276,8 @@ def _run_asr_and_align(
 
     logger.info("Loading whisperX model '%s'...", config.model)
     model = asr_mod.load_whisperx_model(
-        config.model, device, compute_type, config.beam_size, threads=threads
+        config.model, device, compute_type, config.beam_size, threads=threads,
+        vad_device=devices.vad,
     )
     _log_memory("after model load")
     batch_size = asr_mod.resolve_batch_size(config.batch_size, device)

@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -25,10 +26,6 @@ logger = logging.getLogger("transcript_video.asr")
 # (precision >= the float16 used on CUDA). This deliberately diverges from the
 # reference project, which used int8 on CPU and gave up a little accuracy for speed.
 CPU_DEFAULT_COMPUTE_TYPE = "float32"
-
-# Compute types that ask ctranslate2 to choose; never listed by
-# get_supported_compute_types, so they bypass validation.
-_SELF_RESOLVING_COMPUTE_TYPES = frozenset({"default", "auto"})
 
 # Preferred CUDA compute types, best first (float16 first: reference-project parity).
 _CUDA_PREFERENCE = ("float16", "int8_float16", "int8", "float32")
@@ -103,8 +100,10 @@ def torch_cuda_available() -> bool:
     torch wheel on a GPU machine. Cached so the answer is stable within a run.
     """
     try:
+        # Not just ImportError: a broken CUDA torch wheel (missing libcudnn,
+        # libcublas, ...) raises OSError/ValueError from the import itself.
         import torch
-    except ImportError:
+    except Exception:
         return False
     try:
         return bool(torch.cuda.is_available())
@@ -118,78 +117,130 @@ def _warn_once(message: str) -> None:
     logger.warning(message)
 
 
-# Which library runs each stage: ctranslate2 for ASR, torch for the rest.
-BACKEND_CTRANSLATE2 = "ctranslate2"
-BACKEND_TORCH = "torch"
-_BACKEND_STAGES = {
-    BACKEND_CTRANSLATE2: "ASR (ctranslate2)",
-    BACKEND_TORCH: "alignment/diarization (torch)",
-}
+_VALID_DEVICES = ("auto", "cuda", "cpu")
 
 
-def _cuda_available(backend: str) -> bool:
-    if backend == BACKEND_TORCH:
-        return torch_cuda_available()
-    return check_cuda_available()[0]
+@dataclass(frozen=True)
+class DevicePlan:
+    """Where each library runs for one run, decided once before any heavy work.
 
-
-def _exit_cuda_required(backend: str) -> None:
-    """Explicit ``cuda`` that can't be honored: stop instead of silently using CPU."""
-    print(
-        f"Error: device 'cuda' was requested (--device or config) but {_BACKEND_STAGES[backend]} "
-        "cannot use a CUDA device. Fix the GPU setup, or pass --device auto "
-        "(use CPU when there is no GPU) or --device cpu.",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-
-def resolve_device(requested_device: str | None, backend: str = BACKEND_CTRANSLATE2) -> str:
-    """Resolve the device one library (``backend``) runs on.
-
-    - ``"cpu"`` → ``"cpu"``.
-    - ``None`` (auto) → ``"cuda"`` when that library can use CUDA, otherwise
-      ``"cpu"``.
-    - ``"cuda"`` → ``"cuda"``. If that library can't use CUDA, print an error
-      and exit: an explicit GPU request never silently degrades to hours of CPU.
+    - ``asr``: the ctranslate2 device; ``None`` when no ASR runs (resume).
+    - ``torch``: the device for alignment, diarization and embeddings; ``None``
+      when none of them runs (resume without diarization).
+    - ``vad``: where whisperX's pyannote VAD runs. It is a torch model loaded
+      together with the ASR, on the ASR device, except when ctranslate2 can
+      use CUDA and torch can't: then it runs on ``cpu``.
+    - ``error``: set when an explicit ``cuda`` request can't be honored.
+    - ``notes``: warnings worth logging (mixed devices, fallbacks).
+    - ``compute_type``: the ctranslate2 compute type, filled in by the
+      pipeline once ``asr`` is known (see :func:`resolve_compute_type`).
     """
-    if requested_device == "cpu":
-        return "cpu"
-    if _cuda_available(backend):
-        return "cuda"
-    if requested_device == "cuda":
-        _exit_cuda_required(backend)
-    return "cpu"
+
+    asr: str | None
+    torch: str | None
+    vad: str | None = None
+    error: str | None = None
+    notes: tuple[str, ...] = ()
+    compute_type: str | None = None
+
+    @property
+    def torch_on_cpu(self) -> bool:
+        """Some torch work (VAD, alignment, diarization) runs on the CPU."""
+        return "cpu" in (self.torch, self.vad)
+
+    @property
+    def uses_device(self) -> bool:
+        """At least one stage runs (on any device)."""
+        return any((self.asr, self.torch, self.vad))
 
 
-def resolve_device_and_compute(
-    requested_device: str | None, requested_compute: str | None
-) -> tuple[str, str]:
-    """Resolve the actual device + compute type to use.
+def plan_devices(requested: str | None, *, run_asr: bool, run_torch: bool) -> DevicePlan:
+    """Decide the devices for the stages that will run. Never exits.
 
-    - ``requested_device``: ``None`` (auto), ``"cuda"``, or ``"cpu"``. See
-      :func:`resolve_device` for the rules (auto falls back to CPU; explicit
-      ``cuda`` without a GPU exits).
-    - ``requested_compute``: explicit override, otherwise picked automatically:
-      the best CUDA type (``float16`` preferred) on GPU, ``float32`` on CPU.
-      ``default`` / ``auto`` are passed through (ctranslate2 picks). An override
-      the resolved device does not support is replaced, with a warning: an
+    The single source of the device rules, shared by the pre-flight check and
+    the pipeline so they can't disagree:
+
+    - ``cpu``: everything on CPU.
+    - ``auto`` / ``None``: each library uses CUDA when it can, otherwise CPU.
+    - ``cuda``: every library that will run must be able to use CUDA, otherwise
+      ``error`` is set. An explicit GPU request never silently becomes CPU work.
+
+    ``run_asr`` implies torch work too (whisperX's VAD and the alignment).
+    """
+    req = (requested or "auto").lower()
+    if req not in _VALID_DEVICES:
+        return DevicePlan(None, None, error=f"unknown device {requested!r}; use auto, cuda or cpu.")
+    run_torch = run_torch or run_asr
+    if req == "cpu":
+        cpu_if = lambda runs: "cpu" if runs else None  # noqa: E731
+        return DevicePlan(asr=cpu_if(run_asr), torch=cpu_if(run_torch), vad=cpu_if(run_asr))
+
+    ct2_ok = run_asr and check_cuda_available()[0]
+    torch_ok = run_torch and torch_cuda_available()
+
+    if req == "cuda":
+        missing = []
+        if run_asr and not ct2_ok:
+            missing.append("ASR (ctranslate2)")
+        if run_torch and not torch_ok:
+            missing.append("alignment/diarization (torch)")
+        if missing:
+            return DevicePlan(None, None, error=(
+                f"device 'cuda' was requested (--device or config) but {' and '.join(missing)} "
+                "cannot use a CUDA device. Fix the GPU setup, or pass --device auto "
+                "(use CPU when there is no GPU) or --device cpu."
+            ))
+        cuda_if = lambda runs: "cuda" if runs else None  # noqa: E731
+        return DevicePlan(asr=cuda_if(run_asr), torch=cuda_if(run_torch), vad=cuda_if(run_asr))
+
+    asr = ("cuda" if ct2_ok else "cpu") if run_asr else None
+    torch_dev = ("cuda" if torch_ok else "cpu") if run_torch else None
+    vad = asr
+    notes: list[str] = []
+    if asr == "cuda" and torch_dev == "cpu":
+        if cpu_vad_supported():
+            vad = "cpu"
+            notes.append(
+                "Mixed devices: ASR on cuda; VAD, alignment and diarization on cpu "
+                "(torch cannot use CUDA on this machine)."
+            )
+        else:
+            asr = vad = "cpu"
+            notes.append(
+                "torch cannot use CUDA, and this whisperX can't run its VAD apart from "
+                "the ASR: the ASR runs on cpu too."
+            )
+    elif asr == "cpu" and torch_dev == "cuda":
+        notes.append(
+            "Mixed devices: ASR on cpu (ctranslate2 cannot use CUDA), "
+            "alignment/diarization on cuda."
+        )
+    return DevicePlan(asr=asr, torch=torch_dev, vad=vad, notes=tuple(notes))
+
+
+def resolve_compute_type(device: str, requested_compute: str | None) -> str:
+    """The ctranslate2 compute type for ``device``.
+
+    - Unset, ``auto`` or ``default``: the best CUDA type (``float16``
+      preferred, but always one the GPU supports) on GPU, ``float32`` on CPU.
+      Our ``auto`` is this lossless default, **not** ctranslate2's ``auto``,
+      which picks the fastest type (int8 on CPU). ``default`` resolves here too:
+      whisperX would rewrite it to float16/float32 anyway, without checking the
+      GPU, and the JSON should record the type that actually ran.
+    - An override the device does not support is replaced, with a warning: an
       ``int8*`` type by the closest supported ``int8*`` type (so a quantized
       choice stays quantized, e.g. ``int8_float16`` → ``int8_float32`` on CPU),
       anything else by the device default (e.g. ``float16`` → ``float32`` on CPU).
     """
-    device = resolve_device(requested_device, BACKEND_CTRANSLATE2)
     hint = check_cuda_available()[1] if device == "cuda" else None
     default = (hint or "float16") if device == "cuda" else CPU_DEFAULT_COMPUTE_TYPE
 
-    if not requested_compute:
-        return device, default
-    if requested_compute in _SELF_RESOLVING_COMPUTE_TYPES:
-        return device, requested_compute
+    if not requested_compute or requested_compute in ("auto", "default"):
+        return default
 
     supported = _supported_compute_types(device)
     if supported is None or requested_compute in supported:
-        return device, requested_compute
+        return requested_compute
 
     replacement = default
     if requested_compute.startswith("int8"):
@@ -200,7 +251,7 @@ def resolve_device_and_compute(
         f"compute_type '{requested_compute}' is not supported on {device} "
         f"(supported: {', '.join(sorted(supported))}); using '{replacement}' instead."
     )
-    return device, replacement
+    return replacement
 
 
 def _logical_cpu_count() -> int:
@@ -369,17 +420,52 @@ def build_transcribe_kwargs(
     return kwargs
 
 
+# whisperX's default VAD onset (``default_vad_options`` in ``whisperx.asr.load_model``).
+# Only the onset reaches the Pyannote VAD constructor; offset and chunk size are
+# still applied by load_model, to a manually assigned VAD as well.
+_WHISPERX_VAD_ONSET = 0.500
+
+
+def cpu_vad_supported() -> bool:
+    """Whether whisperX can take a VAD built on another device than the ASR.
+
+    Needs ``whisperx.vads.Pyannote`` and a ``load_model`` with a ``vad_model``
+    parameter (whisperX >= 3.4). Without them, whisperX always builds its
+    pyannote VAD on the ASR device.
+    """
+    try:
+        import whisperx
+
+        vads = importlib.import_module("whisperx.vads")
+    except Exception:
+        return False
+    return hasattr(vads, "Pyannote") and _load_model_accepts(whisperx, "vad_model")
+
+
+def _build_vad(device: str):
+    """whisperX's pyannote VAD, built on ``device`` instead of the ASR device."""
+    import torch
+    from whisperx.vads import Pyannote
+
+    return Pyannote(torch.device(device), token=None, vad_onset=_WHISPERX_VAD_ONSET)
+
+
 def load_whisperx_model(
     model_name: str,
     device: str,
     compute_type: str,
     beam_size: int,
     threads: int | None = None,
+    vad_device: str | None = None,
 ):
     """Load a whisperX model. Imports whisperx lazily so failures are clearer.
 
     ``threads`` sets ctranslate2's CPU thread count. It is forwarded only when
     the installed whisperX's ``load_model`` accepts a ``threads`` kwarg.
+
+    ``vad_device``: where whisperX's pyannote VAD (a torch model) runs. When it
+    differs from ``device`` (ASR on CUDA, CPU-only torch), the VAD is built
+    here and passed in; otherwise whisperX builds it on ``device``.
     """
     try:
         import whisperx
@@ -398,6 +484,8 @@ def load_whisperx_model(
     }
     if threads is not None and _load_model_accepts(whisperx, "threads"):
         kwargs["threads"] = threads
+    if vad_device is not None and vad_device != device:
+        kwargs["vad_model"] = _build_vad(vad_device)
     return whisperx.load_model(model_name, **kwargs)
 
 

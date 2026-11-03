@@ -67,3 +67,23 @@ class TestZeroMeansAuto:
         (tmp_path / "transcript-video.toml").write_text("threads = 0\n")
         _run([])
         assert captured["config"].threads is None
+
+
+class TestDeviceValue:
+    """A config `device` bypasses argparse choices, so main() validates it."""
+
+    def test_config_device_is_lowercased(self, captured, tmp_path):
+        (tmp_path / "transcript-video.toml").write_text('device = "CUDA"\n')
+        _run([])
+        assert captured["config"].device == "cuda"
+
+    @pytest.mark.parametrize("value", ["gpu", "cuda:0"])
+    def test_unknown_config_device_is_rejected(self, captured, tmp_path, value):
+        (tmp_path / "transcript-video.toml").write_text(f'device = "{value}"\n')
+        with pytest.raises(SystemExit):
+            _run([])
+        assert "config" not in captured
+
+    def test_auto_maps_to_none(self, captured):
+        _run(["--device", "auto"])
+        assert captured["config"].device is None

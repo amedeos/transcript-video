@@ -118,7 +118,7 @@ transcript-from-video lecture.mp4 --no-diarize --txt --srt
 | `--model NAME` | whisperX model | `large-v3` |
 | `--beam_size N` | Beam search width | `5` |
 | `--device {auto,cuda,cpu}` | Device. `auto` uses the GPU when one is usable, otherwise CPU. `cuda` stops with an error if no GPU is usable | `auto` |
-| `--compute-type TYPE` | Override (e.g. `int8`, `float16`). A type the device can't run is replaced, with a warning: `int8*` by the closest supported `int8*` type, anything else by the device default | auto: `float16` on CUDA, `float32` on CPU |
+| `--compute-type TYPE` | Override (e.g. `int8`, `float16`). A type the device can't run is replaced, with a warning: `int8*` by the closest supported `int8*` type, anything else by the device default. `auto` and `default` mean the lossless default below | `float16` on CUDA, `float32` on CPU |
 | `--threads N` | CPU threads for ASR, alignment and diarization. `0` means auto (undoes a config value) | logical CPUs − 1 (capped by a container CPU quota) for stages on CPU; library defaults for stages on GPU |
 | `--batch-size N` | ASR chunks decoded at once. Changes speed and RAM, never the transcript. Lower it if the run is killed for lack of memory. `0` means auto | `16` on CUDA, `4` on CPU |
 
@@ -491,7 +491,7 @@ No NVIDIA GPU is required. With the default `--device auto` the pipeline uses th
 - **RAM.** `large-v3` in `float32` needs about 6 GB for the model weights alone. On top of that, each chunk in the ASR batch adds about 0.65 GB (estimate). That is why the CPU default is `--batch-size 4` (roughly 10 GB peak) instead of the GPU's 16 (roughly 18 GB, more with a wide beam). The batch never changes the transcript: raise it for speed if you have RAM to spare, lower it to `1` (roughly 8 GB) on a tight machine. `--beam_size` costs mostly time; its RAM cost shows up only at high batch sizes. The ASR model is freed before alignment and diarization load their own models, and the log prints `RAM after …` at each stage.
 - **Faster, lighter, slightly less accurate.** Pass `--compute-type int8`: about 4× less memory for the weights and faster, at a small accuracy cost on hard audio (noise, overlapping speakers, proper names). Picking a smaller `--model` costs much more accuracy than `int8`. `large-v3-turbo` is the usual compromise; avoid `distil-*` models for non-English audio.
 - **Resuming across machines.** `--resume-from-aligned` picks the device from the current machine and the current `--device`, not from the snapshot: you can run ASR on a GPU box and diarize on a laptop, or the other way round. `parameters.device` / `compute_type` in the JSON keep recording what the ASR ran with.
-- **Two libraries, two GPU checks.** ASR uses ctranslate2; alignment, diarization and embeddings use torch. Each is checked on its own. With `auto`, a library that can't use CUDA (e.g. a CPU-only torch wheel) runs its stages on CPU and the log says so. With `cuda`, both must be able to use the GPU.
+- **Two libraries, two GPU checks.** ASR uses ctranslate2; alignment, diarization and embeddings use torch. Each is checked on its own. With `auto`, a library that can't use CUDA (e.g. a CPU-only torch wheel) runs its stages on CPU and the log says so; whisperX's voice-activity detection, a torch model, then runs on CPU while the ASR keeps the GPU. With `cuda`, every library that has work to do must be able to use the GPU (a `--resume-from-aligned` runs no ASR, so it only needs torch).
 
 ## Container (Podman / Docker)
 

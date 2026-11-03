@@ -56,7 +56,6 @@ def stub_pipeline(monkeypatch, fake_audio):
                 ],
             }
 
-    monkeypatch.setattr(pipeline_mod.asr_mod, "resolve_device_and_compute", lambda d, c: ("cuda", "float16"))
     monkeypatch.setattr(pipeline_mod.asr_mod, "check_cuda_available", lambda: (True, "float16"))
     monkeypatch.setattr(pipeline_mod.asr_mod, "torch_cuda_available", lambda: True)
     monkeypatch.setattr(pipeline_mod.asr_mod, "apply_torch_threads", lambda n: None)
@@ -458,30 +457,60 @@ class TestDevices:
         between calls, which sent ASR to cpu and pyannote to cuda in one run.
         """
         calls = {"n": 0}
-        real_resolve = pipeline_mod.asr_mod.resolve_device
+        real_plan = pipeline_mod.asr_mod.plan_devices
 
-        def _counting(requested, backend="ctranslate2"):
+        def _counting(*a, **kw):
             calls["n"] += 1
-            return real_resolve(requested, backend)
+            return real_plan(*a, **kw)
 
-        monkeypatch.setattr(pipeline_mod.asr_mod, "resolve_device", _counting)
+        monkeypatch.setattr(pipeline_mod.asr_mod, "plan_devices", _counting)
         seen = self._capture_stage_devices(monkeypatch)
 
         pipeline_mod.run_pipeline(_config(fake_input, write_md=False))
 
-        assert calls["n"] == 1  # torch device; the ASR device comes from resolve_device_and_compute
+        assert calls["n"] == 1
         assert seen == {"align": "cuda", "diarize": "cuda", "embed": "cuda"}
 
     def test_cpu_only_torch_runs_torch_stages_on_cpu(self, stub_pipeline, fake_input, monkeypatch):
-        """GPU visible to ctranslate2, CPU-only torch wheel, --device auto."""
+        """GPU visible to ctranslate2, CPU-only torch wheel, --device auto.
+
+        whisperX's VAD is a torch model: it must be built on CPU too, while
+        the ASR keeps the GPU. Regression: whisperX put it on cuda:0 and the
+        run crashed at model load.
+        """
         monkeypatch.setattr(pipeline_mod.asr_mod, "torch_cuda_available", lambda: False)
+        monkeypatch.setattr(pipeline_mod.asr_mod, "cpu_vad_supported", lambda: True)
         seen = self._capture_stage_devices(monkeypatch)
+        real_load = pipeline_mod.asr_mod.load_whisperx_model
+
+        def _load(name, device, *a, **kw):
+            seen["asr"], seen["vad"] = device, kw.get("vad_device")
+            return real_load(name, device, *a, **kw)
+
+        monkeypatch.setattr(pipeline_mod.asr_mod, "load_whisperx_model", _load)
 
         written = pipeline_mod.run_pipeline(_config(fake_input, write_md=False))
 
-        assert seen == {"align": "cpu", "diarize": "cpu", "embed": "cpu"}
+        assert seen == {"asr": "cuda", "vad": "cpu", "align": "cpu", "diarize": "cpu", "embed": "cpu"}
         params = json.loads(written["json"].read_text(encoding="utf-8"))["parameters"]
         assert params["device"] == "cuda"  # the ASR's device
+
+    def test_resume_without_diarization_ignores_explicit_cuda(
+        self, stub_pipeline, fake_input, tmp_path, monkeypatch
+    ):
+        """Nothing runs on a device, so a shared `device = "cuda"` config mustn't block it."""
+        pipeline_mod.run_pipeline(_config(fake_input))
+        aligned_path = tmp_path / "video_transcript.aligned.json"
+        monkeypatch.setattr(pipeline_mod.asr_mod, "check_cuda_available", lambda: (False, None))
+        monkeypatch.setattr(pipeline_mod.asr_mod, "torch_cuda_available", lambda: False)
+
+        config = _config(fake_input)
+        config.resume_from_aligned = aligned_path
+        config.diarization = DiarizationConfig(enabled=False)
+        config.device = "cuda"
+        written = pipeline_mod.run_pipeline(config)
+
+        assert json.loads(written["json"].read_text(encoding="utf-8"))["stage"] == "complete"
 
     def test_explicit_cuda_without_torch_cuda_stops_before_asr(
         self, stub_pipeline, fake_input, monkeypatch
@@ -526,9 +555,7 @@ class TestThreads:
     ):
         seen: dict[str, int | None] = {}
         monkeypatch.setattr(pipeline_mod.asr_mod, "available_cpu_count", lambda: 8)
-        monkeypatch.setattr(
-            pipeline_mod.asr_mod, "resolve_device_and_compute", lambda d, c: ("cpu", "float32")
-        )
+        monkeypatch.setattr(pipeline_mod.asr_mod, "check_cuda_available", lambda: (False, None))
         monkeypatch.setattr(pipeline_mod.asr_mod, "torch_cuda_available", lambda: False)
         monkeypatch.setattr(
             pipeline_mod.asr_mod, "apply_torch_threads", lambda n: seen.__setitem__("torch", n)
@@ -564,6 +591,39 @@ class TestThreads:
         assert seen == {"asr": None}
 
 
+class TestThreadPolicyEdges:
+    def test_zero_threads_in_runconfig_is_auto(self, stub_pipeline, fake_input, monkeypatch):
+        """RunConfig(threads=0) on a GPU run keeps library defaults, like None."""
+        seen: dict[str, object] = {}
+        monkeypatch.setattr(
+            pipeline_mod.asr_mod, "apply_torch_threads", lambda n: seen.__setitem__("torch", n)
+        )
+        config = _config(fake_input, write_md=False)
+        config.threads = 0
+        pipeline_mod.run_pipeline(config)
+        assert "torch" not in seen
+
+    def test_cpu_vad_gets_cpu_threads_even_with_torch_on_cuda(self, fake_input, monkeypatch):
+        """ASR + VAD on CPU, alignment/diarization on CUDA: torch still does CPU work."""
+        seen: dict[str, object] = {}
+        monkeypatch.setattr(pipeline_mod.asr_mod, "available_cpu_count", lambda: 8)
+        monkeypatch.setattr(
+            pipeline_mod.asr_mod, "apply_torch_threads", lambda n: seen.__setitem__("torch", n)
+        )
+        plan = pipeline_mod.asr_mod.DevicePlan(asr="cpu", torch="cuda", vad="cpu")
+        config = _config(fake_input, write_md=False)
+        assert pipeline_mod._configure_threads(config, plan) == 7
+        assert seen == {"torch": 7}
+
+    def test_no_stage_logs_nothing_about_threads(self, fake_input, caplog):
+        plan = pipeline_mod.asr_mod.DevicePlan(asr=None, torch=None)
+        config = _config(fake_input, write_md=False)
+        config.threads = 4
+        with caplog.at_level("INFO", logger="transcript_video.pipeline"):
+            assert pipeline_mod._configure_threads(config, plan) is None
+        assert "CPU threads" not in caplog.text
+
+
 class TestBatchSize:
     """ASR batch size: 16 on CUDA, 4 on CPU, explicit value wins."""
 
@@ -583,9 +643,7 @@ class TestBatchSize:
 
     @staticmethod
     def _on_cpu(monkeypatch):
-        monkeypatch.setattr(
-            pipeline_mod.asr_mod, "resolve_device_and_compute", lambda d, c: ("cpu", "float32")
-        )
+        monkeypatch.setattr(pipeline_mod.asr_mod, "check_cuda_available", lambda: (False, None))
         monkeypatch.setattr(pipeline_mod.asr_mod, "torch_cuda_available", lambda: False)
 
     def test_cuda_default_is_16(self, stub_pipeline, seen_batch, fake_input):

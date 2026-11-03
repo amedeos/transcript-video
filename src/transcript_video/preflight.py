@@ -45,40 +45,44 @@ def check_ffmpeg() -> CheckResult:
     )
 
 
-def check_cuda(device_request: str | None) -> CheckResult:
-    """Verify CUDA is usable when the user requested it (or wants auto-detect).
+def check_cuda(
+    device_request: str | None, *, run_asr: bool = True, run_torch: bool = True
+) -> CheckResult:
+    """Verify the requested device can be honored for the stages that will run.
 
-    Checks both libraries that can use the GPU: ctranslate2 (ASR) and torch
-    (alignment, diarization, embeddings). An explicit ``cuda`` fails unless
-    both can use it, since the pipeline would otherwise stop at start-up.
-    ``auto`` never fails: whichever library lacks CUDA runs on CPU.
+    Uses :func:`asr.plan_devices`, the same rules the pipeline applies, so the
+    pre-flight verdict and the actual run can't disagree. An explicit ``cuda``
+    fails unless every library that will run can use it. ``auto`` never fails:
+    whichever library lacks CUDA runs on CPU. ``run_asr=False`` (resume) skips
+    the ctranslate2 requirement; with ``run_torch=False`` too, nothing needs a
+    device.
     """
-    requested = (device_request or "auto").lower()
-    if requested == "cpu":
+    if (device_request or "auto").lower() == "cpu":
         return CheckResult("cuda", True, "skipped (--device cpu)")
 
-    ct2_ok, hint = asr_mod.check_cuda_available()
-    torch_ok = asr_mod.torch_cuda_available()
-    if ct2_ok and torch_ok:
-        return CheckResult("cuda", True, f"available (compute_type hint: {hint})")
+    plan = asr_mod.plan_devices(device_request, run_asr=run_asr, run_torch=run_torch)
+    if plan.error:
+        return CheckResult("cuda", False, plan.error)
 
-    missing = [name for name, ok in (("ctranslate2", ct2_ok), ("torch", torch_ok)) if not ok]
-    if requested == "cuda":
-        return CheckResult(
-            "cuda",
-            False,
-            f"device 'cuda' requested but {' and '.join(missing)} cannot use a CUDA device; "
-            "fix the GPU setup or use --device auto / --device cpu",
-        )
-    if not ct2_ok and not torch_ok:
-        return CheckResult("cuda", True, "not available; pipeline will fall back to CPU (slower)")
-    return CheckResult(
-        "cuda",
-        True,
-        f"partial: {missing[0]} cannot use CUDA, so its stages will run on CPU "
-        f"(ASR on {'cuda' if ct2_ok else 'cpu'}, "
-        f"alignment/diarization on {'cuda' if torch_ok else 'cpu'})",
-    )
+    used = {d for d in (plan.asr, plan.torch, plan.vad) if d}
+    if not used:
+        return CheckResult("cuda", True, "skipped (no stage needs a device)")
+    if used == {"cuda"}:
+        hint = asr_mod.check_cuda_available()[1] if plan.asr else None
+        detail = f"compute_type hint: {hint}" if hint else "torch"
+        return CheckResult("cuda", True, f"available ({detail})")
+    if used == {"cpu"}:
+        message = "not available; pipeline will fall back to CPU (slower)"
+        return CheckResult("cuda", True, " ".join((message, *plan.notes)))
+
+    stages = []
+    if plan.asr:
+        stages.append(f"ASR on {plan.asr}")
+    if plan.vad and plan.vad != plan.asr:
+        stages.append(f"VAD on {plan.vad}")
+    if plan.torch:
+        stages.append(f"alignment/diarization on {plan.torch}")
+    return CheckResult("cuda", True, f"partial: {', '.join(stages)}. {' '.join(plan.notes)}".strip())
 
 
 def _resolve_pipeline_class():
@@ -291,7 +295,9 @@ def run_preflight(config: RunConfig, *, network: bool = True) -> list[CheckResul
     """
     results: list[CheckResult] = []
     results.append(check_ffmpeg())
-    results.append(check_cuda(config.device))
+    results.append(
+        check_cuda(config.device, run_asr=config.runs_asr, run_torch=config.runs_torch)
+    )
     results.append(check_whisperx_api())
 
     if not config.diarization.enabled:

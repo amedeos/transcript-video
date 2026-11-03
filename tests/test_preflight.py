@@ -70,7 +70,8 @@ class TestCheckCuda:
         self._gpu(monkeypatch, ct2=False, torch=False)
         r = check_cuda("cuda")
         assert not r.ok
-        assert "ctranslate2 and torch" in r.message and "--device auto" in r.message
+        assert "ctranslate2" in r.message and "torch" in r.message
+        assert "--device auto" in r.message
 
     def test_cuda_requested_but_torch_lacks_cuda_fails(self, monkeypatch):
         # e.g. a CPU-only torch wheel on a GPU machine.
@@ -86,9 +87,39 @@ class TestCheckCuda:
 
     def test_auto_with_partial_cuda_is_ok(self, monkeypatch):
         self._gpu(monkeypatch, ct2=True, torch=False)
+        monkeypatch.setattr("transcript_video.preflight.asr_mod.cpu_vad_supported", lambda: True)
         r = check_cuda("auto")
         assert r.ok and "partial" in r.message
-        assert "ASR on cuda" in r.message and "alignment/diarization on cpu" in r.message
+        assert "ASR on cuda" in r.message and "VAD on cpu" in r.message
+        assert "alignment/diarization on cpu" in r.message
+
+    def test_all_cpu_after_vad_fallback_is_not_partial(self, monkeypatch):
+        # ct2 sees CUDA, torch doesn't, and whisperX can't take a CPU VAD:
+        # the ASR moves to CPU too, so nothing uses the GPU.
+        self._gpu(monkeypatch, ct2=True, torch=False)
+        monkeypatch.setattr("transcript_video.preflight.asr_mod.cpu_vad_supported", lambda: False)
+        r = check_cuda("auto")
+        assert r.ok and "partial" not in r.message
+        assert "fall back to CPU" in r.message and "ASR runs on cpu too" in r.message
+
+    def test_resume_with_cuda_ignores_ctranslate2(self, monkeypatch):
+        # A resume runs no ASR: only torch must be able to use CUDA.
+        self._gpu(monkeypatch, ct2=False, torch=True)
+        r = check_cuda("cuda", run_asr=False)
+        assert r.ok and "available" in r.message
+
+    def test_resume_without_diarization_needs_no_gpu(self, monkeypatch):
+        self._gpu(monkeypatch, ct2=False, torch=False)
+        r = check_cuda("cuda", run_asr=False, run_torch=False)
+        assert r.ok and "no stage needs a device" in r.message
+
+    def test_run_preflight_passes_the_stages_that_run(self, monkeypatch, cfg, tmp_path):
+        self._gpu(monkeypatch, ct2=False, torch=False)
+        cfg.device = "cuda"
+        cfg.resume_from_aligned = tmp_path / "x.aligned.json"
+        cfg.diarization = DiarizationConfig(enabled=False)
+        results = {r.name: r for r in run_preflight(cfg, network=False)}
+        assert results["cuda"].ok
 
 
 class TestCheckWhisperxApi:

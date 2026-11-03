@@ -72,7 +72,8 @@ Examples:
         default=None,
         help=(
             "Override compute type (e.g. float16, int8, int8_float16). "
-            "Default: auto (float16 on CUDA, float32 on CPU)."
+            "Unset, 'auto' or 'default': float16 on CUDA (or the best type the GPU "
+            "supports), float32 on CPU (lossless)."
         ),
     )
     model_group.add_argument(
@@ -372,6 +373,13 @@ def main(argv: list[str] | None = None) -> None:
             )
         if value == 0:
             setattr(args, dest, None)
+
+    # `choices` doesn't apply to config-file defaults: a TOML `device = "CUDA"`
+    # or "cuda:0" would otherwise slip past the explicit-cuda safety stop.
+    device = str(args.device).strip().lower()
+    if device not in ("auto", "cuda", "cpu"):
+        parser.error(f"--device / config 'device' must be auto, cuda or cpu (got {args.device!r})")
+    args.device = device
 
     setup_logging(quiet=args.quiet, verbose=args.verbose)
     silence_known_noisy_warnings()

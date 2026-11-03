@@ -60,8 +60,9 @@ class TestCudaProbe:
         _install_fake_ctranslate2(monkeypatch, device_count=0, compute_types=flaky)
         results = {asr.check_cuda_available() for _ in range(3)}
         assert results == {(False, None)}
-        assert asr.resolve_device_and_compute(None, None) == ("cpu", "float32")
-        assert asr.resolve_device(None) == "cpu"
+        plan = asr.plan_devices(None, run_asr=True, run_torch=True)
+        assert plan.asr == "cpu"
+        assert asr.resolve_compute_type(plan.asr, None) == "float32"
 
     def test_probe_is_cached(self, monkeypatch):
         calls = {"n": 0}
@@ -130,95 +131,188 @@ class TestTorchCudaProbe:
         monkeypatch.setitem(sys.modules, "torch", None)
         assert asr.torch_cuda_available() is False
 
+    def test_broken_cuda_wheel_means_unavailable(self, monkeypatch):
+        # A CUDA torch wheel with missing libcudnn raises OSError on import.
+        import builtins
 
-class TestResolveDeviceAndCompute:
-    def test_auto_with_gpu(self, gpu):
-        assert asr.resolve_device_and_compute(None, None) == ("cuda", "float16")
+        real_import = builtins.__import__
 
-    def test_auto_without_gpu_is_lossless_float32(self, no_gpu):
-        assert asr.resolve_device_and_compute(None, None) == ("cpu", "float32")
+        def _import(name, *a, **kw):
+            if name == "torch":
+                raise OSError("libcudnn.so.9: cannot open shared object file")
+            return real_import(name, *a, **kw)
 
-    def test_explicit_cuda_without_gpu_stops(self, no_gpu, capsys):
-        with pytest.raises(SystemExit) as exc:
-            asr.resolve_device_and_compute("cuda", None)
-        assert exc.value.code == 1
-        err = capsys.readouterr().err
-        assert "device 'cuda' was requested" in err and "--device auto" in err
+        monkeypatch.delitem(sys.modules, "torch", raising=False)
+        monkeypatch.setattr(builtins, "__import__", _import)
+        assert asr.torch_cuda_available() is False
 
-    def test_explicit_cpu_on_gpu_machine(self, gpu):
-        assert asr.resolve_device_and_compute("cpu", None) == ("cpu", "float32")
+
+class TestResolveComputeType:
+    def test_cuda_default(self, gpu):
+        assert asr.resolve_compute_type("cuda", None) == "float16"
+
+    def test_cpu_default_is_lossless_float32(self, no_gpu):
+        assert asr.resolve_compute_type("cpu", None) == "float32"
+
+    @pytest.mark.parametrize(("device", "expected"), [("cpu", "float32"), ("cuda", "float16")])
+    def test_auto_is_our_lossless_default(self, gpu, device, expected):
+        # Not ctranslate2's "auto" (fastest type, i.e. int8 on CPU).
+        assert asr.resolve_compute_type(device, "auto") == expected
+
+    def test_default_resolves_to_the_real_type(self, monkeypatch):
+        # whisperX would turn "default" into float16 on any GPU, even one
+        # without float16 kernels; resolve it with the probe instead.
+        monkeypatch.setattr(asr, "check_cuda_available", lambda: (True, "int8_float16"))
+        assert asr.resolve_compute_type("cuda", "default") == "int8_float16"
+        assert asr.resolve_compute_type("cpu", "default") == "float32"
 
     def test_explicit_int8_on_cpu_is_kept(self, no_gpu):
-        assert asr.resolve_device_and_compute("cpu", "int8") == ("cpu", "int8")
+        assert asr.resolve_compute_type("cpu", "int8") == "int8"
 
     def test_float16_on_cpu_becomes_float32(self, no_gpu, caplog):
         with caplog.at_level(logging.WARNING, logger="transcript_video.asr"):
-            assert asr.resolve_device_and_compute(None, "float16") == ("cpu", "float32")
+            assert asr.resolve_compute_type("cpu", "float16") == "float32"
         assert "not supported on cpu" in caplog.text
 
     def test_supported_override_on_cuda_is_kept(self, gpu):
-        assert asr.resolve_device_and_compute("cuda", "int8_float16") == ("cuda", "int8_float16")
+        assert asr.resolve_compute_type("cuda", "int8_float16") == "int8_float16"
 
     def test_unsupported_override_on_cuda_uses_cuda_default(self, gpu, caplog):
         with caplog.at_level(logging.WARNING, logger="transcript_video.asr"):
-            assert asr.resolve_device_and_compute("cuda", "bfloat16") == ("cuda", "float16")
+            assert asr.resolve_compute_type("cuda", "bfloat16") == "float16"
         assert "not supported on cuda" in caplog.text
 
     def test_quantized_override_stays_quantized_on_cpu(self, no_gpu, caplog):
         # A GPU config with int8_float16 used on a laptop: keep int8, don't jump to float32.
         with caplog.at_level(logging.WARNING, logger="transcript_video.asr"):
-            assert asr.resolve_device_and_compute(None, "int8_float16") == ("cpu", "int8_float32")
+            assert asr.resolve_compute_type("cpu", "int8_float16") == "int8_float32"
         assert "using 'int8_float32'" in caplog.text
-
-    @pytest.mark.parametrize("ct", ["default", "auto"])
-    def test_self_resolving_types_pass_through(self, no_gpu, caplog, ct):
-        with caplog.at_level(logging.WARNING, logger="transcript_video.asr"):
-            assert asr.resolve_device_and_compute(None, ct) == ("cpu", ct)
-        assert caplog.text == ""
 
     def test_compute_type_warning_logged_once(self, no_gpu, caplog):
         with caplog.at_level(logging.WARNING, logger="transcript_video.asr"):
-            asr.resolve_device_and_compute(None, "float16")
-            asr.resolve_device_and_compute(None, "float16")
+            asr.resolve_compute_type("cpu", "float16")
+            asr.resolve_compute_type("cpu", "float16")
         assert caplog.text.count("not supported on cpu") == 1
 
     def test_override_kept_when_supported_types_unknown(self, monkeypatch):
         monkeypatch.setattr(asr, "check_cuda_available", lambda: (False, None))
         monkeypatch.setattr(asr, "_supported_compute_types", lambda d: None)
-        assert asr.resolve_device_and_compute(None, "int8") == ("cpu", "int8")
+        assert asr.resolve_compute_type("cpu", "int8") == "int8"
 
     def test_cuda_hint_is_used(self, monkeypatch):
         monkeypatch.setattr(asr, "check_cuda_available", lambda: (True, "int8_float16"))
-        assert asr.resolve_device_and_compute(None, None) == ("cuda", "int8_float16")
+        assert asr.resolve_compute_type("cuda", None) == "int8_float16"
 
 
-class TestResolveDevice:
+def _plan(requested, *, run_asr=True, run_torch=True):
+    return asr.plan_devices(requested, run_asr=run_asr, run_torch=run_torch)
+
+
+class TestPlanDevices:
+    @pytest.fixture
+    def ct2_only(self, monkeypatch):
+        """GPU visible to ctranslate2, but a CPU-only torch wheel is installed."""
+        monkeypatch.setattr(asr, "check_cuda_available", lambda: (True, "float16"))
+        monkeypatch.setattr(asr, "torch_cuda_available", lambda: False)
+
     def test_cpu(self, gpu):
-        assert asr.resolve_device("cpu") == "cpu"
+        plan = _plan("cpu")
+        assert (plan.asr, plan.torch, plan.vad, plan.error) == ("cpu", "cpu", "cpu", None)
 
-    def test_auto_gpu(self, gpu):
-        assert asr.resolve_device(None) == "cuda"
+    @pytest.mark.parametrize("requested", [None, "auto", "AUTO"])
+    def test_auto_gpu(self, gpu, requested):
+        plan = _plan(requested)
+        assert (plan.asr, plan.torch, plan.vad, plan.notes) == ("cuda", "cuda", "cuda", ())
 
     def test_auto_without_gpu(self, no_gpu):
-        assert asr.resolve_device(None) == "cpu"
+        plan = _plan(None)
+        assert (plan.asr, plan.torch, plan.vad, plan.error) == ("cpu", "cpu", "cpu", None)
 
-    def test_cuda_without_gpu_stops(self, no_gpu):
-        with pytest.raises(SystemExit):
-            asr.resolve_device("cuda")
+    def test_cuda_without_gpu_is_an_error(self, no_gpu):
+        plan = _plan("cuda")
+        assert plan.error and "ASR (ctranslate2) and alignment/diarization (torch)" in plan.error
+        assert "--device auto" in plan.error
 
-    def test_torch_backend_uses_torch_probe(self, monkeypatch):
-        # GPU visible to ctranslate2, but a CPU-only torch wheel is installed.
-        monkeypatch.setattr(asr, "check_cuda_available", lambda: (True, "float16"))
-        monkeypatch.setattr(asr, "torch_cuda_available", lambda: False)
-        assert asr.resolve_device(None, asr.BACKEND_CTRANSLATE2) == "cuda"
-        assert asr.resolve_device(None, asr.BACKEND_TORCH) == "cpu"
+    def test_explicit_cuda_needs_torch_too(self, ct2_only):
+        plan = _plan("cuda")
+        assert plan.error and "alignment/diarization (torch)" in plan.error
+        assert "ctranslate2" not in plan.error
 
-    def test_explicit_cuda_stops_when_torch_lacks_cuda(self, monkeypatch, capsys):
-        monkeypatch.setattr(asr, "check_cuda_available", lambda: (True, "float16"))
-        monkeypatch.setattr(asr, "torch_cuda_available", lambda: False)
-        with pytest.raises(SystemExit):
-            asr.resolve_device("cuda", asr.BACKEND_TORCH)
-        assert "alignment/diarization (torch)" in capsys.readouterr().err
+    def test_ct2_only_runs_vad_on_cpu(self, ct2_only, monkeypatch):
+        monkeypatch.setattr(asr, "cpu_vad_supported", lambda: True)
+        plan = _plan(None)
+        assert (plan.asr, plan.vad, plan.torch) == ("cuda", "cpu", "cpu")
+        assert "VAD, alignment and diarization on cpu" in plan.notes[0]
+
+    def test_ct2_only_without_cpu_vad_support_puts_asr_on_cpu(self, ct2_only, monkeypatch):
+        monkeypatch.setattr(asr, "cpu_vad_supported", lambda: False)
+        plan = _plan(None)
+        assert (plan.asr, plan.vad, plan.torch) == ("cpu", "cpu", "cpu")
+        assert "ASR runs on cpu too" in plan.notes[0]
+
+    def test_torch_only_keeps_vad_with_asr_on_cpu(self, monkeypatch):
+        monkeypatch.setattr(asr, "check_cuda_available", lambda: (False, None))
+        monkeypatch.setattr(asr, "torch_cuda_available", lambda: True)
+        plan = _plan(None)
+        assert (plan.asr, plan.vad, plan.torch) == ("cpu", "cpu", "cuda")
+        assert "Mixed devices" in plan.notes[0]
+
+    def test_resume_with_cuda_needs_only_torch(self, monkeypatch):
+        # ctranslate2 lacks CUDA, but a resume runs no ASR.
+        monkeypatch.setattr(asr, "check_cuda_available", lambda: (False, None))
+        monkeypatch.setattr(asr, "torch_cuda_available", lambda: True)
+        plan = _plan("cuda", run_asr=False)
+        assert (plan.asr, plan.vad, plan.torch, plan.error) == (None, None, "cuda", None)
+
+    def test_resume_without_diarization_needs_no_device(self, no_gpu):
+        plan = _plan("cuda", run_asr=False, run_torch=False)
+        assert (plan.asr, plan.torch, plan.error) == (None, None, None)
+
+    def test_asr_implies_torch(self, gpu):
+        assert _plan(None, run_torch=False).torch == "cuda"
+
+    @pytest.mark.parametrize("requested", ["gpu", "cuda:0"])
+    def test_unknown_device_is_an_error(self, gpu, requested):
+        assert "unknown device" in _plan(requested).error
+
+    def test_probes_skipped_for_stages_that_dont_run(self, monkeypatch):
+        def _boom():
+            raise AssertionError("probed a library that runs no stage")
+
+        monkeypatch.setattr(asr, "check_cuda_available", _boom)
+        monkeypatch.setattr(asr, "torch_cuda_available", _boom)
+        _plan("cuda", run_asr=False, run_torch=False)
+
+
+class TestVadDevice:
+    """whisperX builds its pyannote VAD on the ASR device unless we pass one."""
+
+    @pytest.fixture
+    def fake_whisperx(self, monkeypatch):
+        calls: dict = {}
+        fake = types.ModuleType("whisperx")
+
+        def load_model(name, device, compute_type="float16", asr_options=None, vad_model=None):
+            calls.update(device=device, vad_model=vad_model)
+            return "model"
+
+        fake.load_model = load_model
+        monkeypatch.setitem(sys.modules, "whisperx", fake)
+        monkeypatch.setattr(asr, "_build_vad", lambda device: f"vad@{device}")
+        return calls
+
+    def test_vad_built_on_cpu_when_it_differs(self, fake_whisperx):
+        asr.load_whisperx_model("large-v3", "cuda", "float16", 5, vad_device="cpu")
+        assert fake_whisperx == {"device": "cuda", "vad_model": "vad@cpu"}
+
+    @pytest.mark.parametrize("vad_device", [None, "cuda"])
+    def test_whisperx_default_vad_otherwise(self, fake_whisperx, vad_device):
+        asr.load_whisperx_model("large-v3", "cuda", "float16", 5, vad_device=vad_device)
+        assert fake_whisperx == {"device": "cuda", "vad_model": None}
+
+    def test_cpu_vad_unsupported_without_whisperx(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "whisperx", None)
+        assert asr.cpu_vad_supported() is False
 
 
 class TestBatchSize:
