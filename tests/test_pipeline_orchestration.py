@@ -139,11 +139,38 @@ class TestRunPipelineHappyPath:
         md = written["md"].read_text(encoding="utf-8")
         assert "## [00:00:00] SPEAKER_00" in md
 
-    def test_schema_version_is_two(self, stub_pipeline, fake_input):
+    def test_schema_version_is_three_with_batch_size(self, stub_pipeline, fake_input):
         config = _config(fake_input, write_md=False)
         written = pipeline_mod.run_pipeline(config)
         final = json.loads(written["json"].read_text(encoding="utf-8"))
-        assert final["schema_version"] == 2
+        assert final["schema_version"] == 3
+        assert final["parameters"]["batch_size"] == 16  # stub_pipeline runs on cuda
+
+    def test_resume_keeps_the_snapshot_batch_size(self, stub_pipeline, fake_input, tmp_path):
+        config = _config(fake_input, write_md=False)
+        config.batch_size = 2
+        pipeline_mod.run_pipeline(config)
+
+        resume = _config(fake_input, write_md=False)
+        resume.resume_from_aligned = tmp_path / "video_transcript.aligned.json"
+        final = json.loads(pipeline_mod.run_pipeline(resume)["json"].read_text(encoding="utf-8"))
+        assert final["parameters"]["batch_size"] == 2
+
+    def test_resume_from_v2_snapshot_has_unknown_batch_size(
+        self, stub_pipeline, fake_input, tmp_path
+    ):
+        pipeline_mod.run_pipeline(_config(fake_input, write_md=False))
+        snap_path = tmp_path / "video_transcript.aligned.json"
+        snap = json.loads(snap_path.read_text(encoding="utf-8"))
+        snap["schema_version"] = 2
+        del snap["parameters"]["batch_size"]
+        snap_path.write_text(json.dumps(snap), encoding="utf-8")
+
+        resume = _config(fake_input, write_md=False)
+        resume.resume_from_aligned = snap_path
+        final = json.loads(pipeline_mod.run_pipeline(resume)["json"].read_text(encoding="utf-8"))
+        assert final["schema_version"] == 3
+        assert final["parameters"]["batch_size"] is None
 
     def test_speaker_clusters_cached_in_complete_payload(self, stub_pipeline, fake_input):
         config = _config(fake_input, write_md=False)
@@ -165,7 +192,7 @@ class TestRunPipelineHappyPath:
             (tmp_path / "video_transcript.aligned.json").read_text(encoding="utf-8")
         )
         # Aligned stage runs before diarization → no clusters.
-        assert aligned["schema_version"] == 2
+        assert aligned["schema_version"] == 3
         assert aligned["speaker_clusters"] == {}
 
     def test_no_diarize_skips_aligned_snapshot(self, stub_pipeline, fake_input, tmp_path):

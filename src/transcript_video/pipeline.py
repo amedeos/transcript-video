@@ -37,6 +37,11 @@ logger = logging.getLogger("transcript_video.pipeline")
 STAGE_ALIGNED = "aligned"
 STAGE_COMPLETE = "complete"
 
+# Transcript JSON schema. v2: speaker_clusters + speaker_identities.
+# v3: parameters.batch_size (the ASR batch can shift the transcript by
+# floating-point noise, so record what produced it).
+SCHEMA_VERSION = 3
+
 KNOWN_MEDIA_EXTENSIONS = frozenset({
     ".mp4", ".mkv", ".mov", ".webm", ".avi", ".flv", ".wmv",
     ".mpeg", ".mpg", ".m4v", ".ts", ".mts", ".m2ts", ".ogv", ".3gp",
@@ -130,6 +135,7 @@ def _build_payload(
     processing_seconds: float,
     speaker_clusters: dict[str, Any] | None = None,
     speaker_identities: dict[str, Any] | None = None,
+    batch_size: int | None = None,
 ) -> dict[str, Any]:
     """Build the canonical JSON payload. Used for both aligned and complete stages.
 
@@ -142,7 +148,11 @@ def _build_payload(
     is ``"auto"`` for DB matches and ``"manual"`` for entries coming from
     the user's ``--speaker-map``.
 
-    Schema version 2 added both ``speaker_clusters`` and ``speaker_identities``.
+    ``batch_size`` is the ASR batch that produced the segments; ``None`` when
+    unknown (a resume from a v2 snapshot).
+
+    Schema version 2 added both ``speaker_clusters`` and ``speaker_identities``;
+    version 3 added ``parameters.batch_size``.
     Consumers that only look at ``segments`` / ``parameters`` / ``stats``
     (notably :mod:`markdown`) are forward- and backward-compatible without
     changes.
@@ -153,7 +163,7 @@ def _build_payload(
     # place; idempotent on resume because the same thresholds always apply.
     stats_mod.mark_suspect_segments(segments)
     return {
-        "schema_version": 2,
+        "schema_version": SCHEMA_VERSION,
         "stage": stage,
         "source_file": str(source_file),
         "transcribed_at": transcribed_at.isoformat(timespec="seconds"),
@@ -164,6 +174,7 @@ def _build_payload(
             "device": device,
             "compute_type": compute_type,
             "beam_size": config.beam_size,
+            "batch_size": batch_size,
             "vad_filter": True,
             "language_forced": config.language,
             "initial_prompt": config.initial_prompt or None,
@@ -345,6 +356,7 @@ def _run_asr_and_align(
         language_probability=asr_result.get("language_probability"),
         segments=aligned_segments,
         processing_seconds=align_seconds,
+        batch_size=batch_size,
     )
 
     # Free safety net: write the aligned payload before diarization touches anything.
@@ -478,6 +490,7 @@ def _diarize_payload(
         processing_seconds=float(payload.get("stats", {}).get("processing_seconds") or 0.0),
         speaker_clusters=speaker_clusters,
         speaker_identities=speaker_identities,
+        batch_size=payload["parameters"].get("batch_size"),
     )
 
 

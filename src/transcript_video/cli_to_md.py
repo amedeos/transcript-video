@@ -107,7 +107,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Auto-match the JSON's cached cluster embeddings against the voice DB "
             "and inject the names into speaker_identities at re-render time. "
-            "Requires a schema v2 JSON (cluster embeddings present); no audio, no GPU."
+            "Requires a schema v2+ JSON (cluster embeddings present); no audio, no GPU."
         ),
     )
     identify_group.add_argument(

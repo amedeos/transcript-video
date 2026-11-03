@@ -95,7 +95,7 @@ Examples:
         default=None,
         metavar="N",
         help=(
-            "ASR chunks decoded at once. Changes speed and memory, not the transcript. "
+            "ASR chunks decoded at once. Changes speed and memory, not accuracy. "
             f"Default (or 0): {GPU_DEFAULT_BATCH_SIZE} on CUDA, {CPU_DEFAULT_BATCH_SIZE} on CPU. "
             "Lower it if the run is killed for lack of memory."
         ),

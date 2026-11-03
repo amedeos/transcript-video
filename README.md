@@ -120,7 +120,7 @@ transcript-from-video lecture.mp4 --no-diarize --txt --srt
 | `--device {auto,cuda,cpu}` | Device. `auto` uses the GPU when one is usable, otherwise CPU. `cuda` stops with an error if no GPU is usable | `auto` |
 | `--compute-type TYPE` | Override (e.g. `int8`, `float16`; any case). Only ctranslate2's types are accepted, so a typo stops with an error. A type the device can't run is replaced, with a warning: `int8*` by the closest supported `int8*` type, anything else by the device default. `auto` and `default` mean the lossless default below | `float16` on CUDA, `float32` on CPU |
 | `--threads N` | CPU threads for ASR, alignment and diarization. `0` means auto (undoes a config value) | logical CPUs − 1 (capped by a container CPU quota) for stages on CPU; library defaults for stages on GPU |
-| `--batch-size N` | ASR chunks decoded at once. Changes speed and RAM, never the transcript. Lower it if the run is killed for lack of memory. `0` means auto | `16` on CUDA, `4` on CPU |
+| `--batch-size N` | ASR chunks decoded at once. Changes speed and RAM, not accuracy: the text can differ only by floating-point noise, and the value is recorded in the JSON. Lower it if the run is killed for lack of memory. `0` means auto | `16` on CUDA, `4` on CPU |
 
 **Language**
 
@@ -358,7 +358,7 @@ All outputs default to the input directory with the suffix `_transcript`. With `
 
 ```jsonc
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "stage": "complete",
   "source_file": "/abs/path/video.mp4",
   "transcribed_at": "2026-05-05T10:30:00",
@@ -369,6 +369,7 @@ All outputs default to the input directory with the suffix `_transcript`. With `
     "device": "cuda",
     "compute_type": "float16",
     "beam_size": 5,
+    "batch_size": 16,
     "vad_filter": true,
     "language_forced": null,
     "initial_prompt": null,
@@ -488,7 +489,7 @@ No NVIDIA GPU is required. With the default `--device auto` the pipeline uses th
 
 - **No accuracy loss by default.** On CPU the ASR runs in `float32`, which is at least as precise as the `float16` used on GPU (ctranslate2 has no `float16` on CPU). Alignment (wav2vec2) and diarization (pyannote) run in `float32` on both devices. Expect small numeric differences between machines, not worse transcripts.
 - **Threads.** By default stages running on CPU use all logical CPUs but one, which leaves the machine responsive. Inside a container with a CPU quota (`podman run --cpus=4`), the quota counts as the number of CPUs. Stages running on the GPU keep their libraries' own defaults. Override with `--threads N` or `threads = N` in the config file, which applies to every stage.
-- **RAM.** `large-v3` in `float32` needs about 6 GB for the model weights alone. On top of that, each chunk in the ASR batch adds about 0.65 GB (estimate). That is why the CPU default is `--batch-size 4` (roughly 10 GB peak) instead of the GPU's 16 (roughly 18 GB, more with a wide beam). The batch never changes the transcript: raise it for speed if you have RAM to spare, lower it to `1` (roughly 8 GB) on a tight machine. `--beam_size` costs mostly time; its RAM cost shows up only at high batch sizes. The ASR model is freed before alignment and diarization load their own models, and the log prints `RAM after …` at each stage.
+- **RAM.** `large-v3` in `float32` needs about 6 GB for the model weights alone. On top of that, each chunk in the ASR batch adds about 0.65 GB (estimate). That is why the CPU default is `--batch-size 4` (roughly 10 GB peak) instead of the GPU's 16 (roughly 18 GB, more with a wide beam). The batch doesn't cost accuracy (results can differ only by floating-point noise): raise it for speed if you have RAM to spare, lower it to `1` (roughly 8 GB) on a tight machine. `--beam_size` costs mostly time; its RAM cost shows up only at high batch sizes. The ASR model is freed before alignment and diarization load their own models, and the log prints `RAM after …` at each stage.
 - **Faster, lighter, slightly less accurate.** Pass `--compute-type int8`: about 4× less memory for the weights and faster, at a small accuracy cost on hard audio (noise, overlapping speakers, proper names). Picking a smaller `--model` costs much more accuracy than `int8`. `large-v3-turbo` is the usual compromise; avoid `distil-*` models for non-English audio.
 - **Resuming across machines.** `--resume-from-aligned` picks the device from the current machine and the current `--device`, not from the snapshot: you can run ASR on a GPU box and diarize on a laptop, or the other way round. `parameters.device` / `compute_type` in the JSON keep recording what the ASR ran with.
 - **Two libraries, two GPU checks.** ASR uses ctranslate2; alignment, diarization and embeddings use torch. Each is checked on its own. With `auto`, a library that can't use CUDA (e.g. a CPU-only torch wheel) runs its stages on CPU and the log says so; whisperX's voice-activity detection, a torch model, then runs on CPU while the ASR keeps the GPU. With `cuda`, every library that has work to do must be able to use the GPU (a `--resume-from-aligned` runs no ASR, so it only needs torch).
@@ -578,7 +579,7 @@ whisperX ships alignment models for a fixed list of languages. If yours is missi
 
 ### Out of memory (GPU or CPU)
 
-On CPU the symptom is a bare `Killed` (the kernel's OOM killer), usually during ASR. The `RAM after …` log lines show how much each stage used. Try these in order. The first keeps the transcript as it is; the other two trade accuracy for memory:
+On CPU the symptom is a bare `Killed` (the kernel's OOM killer), usually during ASR. The `RAM after …` log lines show how much each stage used. Try these in order. The first costs no accuracy; the other two trade accuracy for memory:
 
 1. **Lower the batch**: `--batch-size 1` (or `2`). It costs speed, not accuracy, and it is the main lever: ASR memory grows mostly with the batch. A wide `--beam_size` adds a few GB only at high batch sizes.
 2. **Quantize**: `--compute-type int8` makes the weights about 4× smaller, at a small accuracy cost on hard audio.

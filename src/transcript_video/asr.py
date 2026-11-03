@@ -50,7 +50,8 @@ MIN_GPU_COMPUTE_TYPE = "float16"
 
 # ASR batch size: how many 30 s VAD chunks whisperX decodes at once. Each chunk
 # is padded to 30 s and decoded on its own, so the batch changes speed and
-# memory, never the transcript. ASR RAM grows with the batch: each chunk holds
+# memory, not what gets decoded (results can differ only by floating-point
+# noise; recorded in parameters.batch_size). ASR RAM grows with the batch: each chunk holds
 # its own encoder activations and cross-attention cache, about 0.65 GB per
 # chunk for large-v3 in float32 (extrapolated from measurements on tiny and small).
 # beam_size barely matters: the cross-attention cache is not copied per beam
