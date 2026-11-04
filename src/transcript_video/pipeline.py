@@ -24,6 +24,7 @@ from typing import Any
 
 from . import asr as asr_mod
 from . import diarize as diarize_mod
+from . import parakeet as parakeet_mod
 from . import speaker_db as speaker_db_mod
 from . import speaker_embed as speaker_embed_mod
 from . import stats as stats_mod
@@ -40,7 +41,13 @@ STAGE_COMPLETE = "complete"
 # Transcript JSON schema. v2: speaker_clusters + speaker_identities.
 # v3: parameters.batch_size (the ASR batch can shift the transcript by
 # floating-point noise, so record what produced it).
-SCHEMA_VERSION = 3
+# v4: a second ASR engine (Parakeet). parameters.model_revision and
+# parameters.vad (null for whisperX); segments[].token_logprob and
+# words[].logprob (Parakeet). For Parakeet the whisperX-only parameters
+# (beam_size, language_forced, prompt, hotwords, anti-loop values),
+# suspect_thresholds and audio_info.language_detected / language_probability
+# are null.
+SCHEMA_VERSION = 4
 
 KNOWN_MEDIA_EXTENSIONS = frozenset({
     ".mp4", ".mkv", ".mov", ".webm", ".avi", ".flv", ".wmv",
@@ -104,6 +111,8 @@ def _normalize_segment(seg: dict[str, Any]) -> dict[str, Any]:
         out["avg_logprob"] = seg["avg_logprob"]
     if "no_speech_prob" in seg:
         out["no_speech_prob"] = seg["no_speech_prob"]
+    if "token_logprob" in seg:  # Parakeet's confidence (not whisperX's avg_logprob)
+        out["token_logprob"] = seg["token_logprob"]
     if "words" in seg and seg["words"]:
         words: list[dict[str, Any]] = []
         for w in seg["words"]:
@@ -114,11 +123,111 @@ def _normalize_segment(seg: dict[str, Any]) -> dict[str, Any]:
                 entry["end"] = w["end"]
             if "score" in w:
                 entry["score"] = w["score"]
+            if "logprob" in w:
+                entry["logprob"] = w["logprob"]
             if "speaker" in w and w["speaker"]:
                 entry["speaker"] = w["speaker"]
             words.append(entry)
         out["words"] = words
     return out
+
+
+def _asr_parameters(
+    config: RunConfig,
+    *,
+    device: str,
+    compute_type: str,
+    batch_size: int | None,
+    engine: str = asr_mod.ENGINE_WHISPERX,
+) -> dict[str, Any]:
+    """The ``parameters`` that describe the ASR of this run (all but ``diarization``).
+
+    Both engines write the same keys; what doesn't apply to an engine is
+    ``null``. ``model`` is the model that ran (``--model auto`` resolved).
+    """
+    model = asr_mod.resolve_model_name(config.model, engine)
+    if engine == asr_mod.ENGINE_PARAKEET:
+        return {
+            "backend": "onnx-asr",
+            "asr": f"onnx-asr-{model}",
+            "model": model,
+            "model_revision": parakeet_mod.HF_REVISION,
+            "device": device,
+            "compute_type": compute_type,
+            "beam_size": None,
+            "batch_size": batch_size,
+            "vad_filter": True,
+            "vad": {
+                "model": "silero",
+                "revision": parakeet_mod.VAD_REVISION,
+                "min_silence_ms": parakeet_mod.MIN_SILENCE_MS,
+                "max_chunk_s": parakeet_mod.MAX_CHUNK_S,
+                "speech_pad_ms": parakeet_mod.SPEECH_PAD_MS,
+            },
+            "language_forced": None,
+            "initial_prompt": None,
+            "hotwords": None,
+            "anti_loop": None,
+            "condition_on_previous_text": None,
+            "compression_ratio_threshold": None,
+            "no_speech_threshold": None,
+            # Parakeet has no avg_logprob / no_speech_prob: nothing to flag.
+            "suspect_thresholds": None,
+        }
+    return {
+        "backend": "whisperx",
+        "asr": f"whisperx-{model}",
+        "model": model,
+        "model_revision": None,
+        "device": device,
+        "compute_type": compute_type,
+        "beam_size": asr_mod.resolve_beam_size(config.beam_size),
+        "batch_size": batch_size,
+        "vad_filter": True,
+        "vad": None,
+        "language_forced": config.language,
+        "initial_prompt": config.initial_prompt or None,
+        "hotwords": config.hotwords or None,
+        "anti_loop": config.anti_loop,
+        "condition_on_previous_text": False if config.anti_loop else None,
+        "compression_ratio_threshold": 2.0 if config.anti_loop else None,
+        "no_speech_threshold": 0.5 if config.anti_loop else None,
+        "suspect_thresholds": {
+            "avg_logprob": stats_mod.DEFAULT_AVG_LOGPROB_THRESHOLD,
+            "no_speech_prob": stats_mod.DEFAULT_NO_SPEECH_PROB_THRESHOLD,
+        },
+    }
+
+
+def _snapshot_asr_parameters(payload: dict[str, Any]) -> dict[str, Any]:
+    """The ASR ``parameters`` of a snapshot, for a resume: what produced its segments.
+
+    Everything but ``diarization`` is carried as recorded. The current run's
+    model, language or prompt flags did not touch these segments, so they
+    must not relabel them. Keys an older snapshot predates (``batch_size``
+    before v3, ``model_revision`` / ``vad`` before v4) are ``None``, so every
+    v4 file has them.
+    """
+    asr = {k: v for k, v in (payload.get("parameters") or {}).items() if k != "diarization"}
+    for key in ("batch_size", "model_revision", "vad"):  # keys older snapshots predate
+        asr.setdefault(key, None)
+    return asr
+
+
+def _applied_suspect_thresholds(asr_parameters: dict[str, Any]) -> dict[str, float] | None:
+    """The thresholds :func:`stats.mark_suspect_segments` applies in this run, as recorded.
+
+    The flags are always recomputed with the current defaults (a resume
+    included), so the record must be the current defaults too, not a
+    snapshot's copy. ``None`` stays ``None``: an ASR that records it has no
+    confidences these thresholds can read, and no segment gets flagged.
+    """
+    if "suspect_thresholds" in asr_parameters and asr_parameters["suspect_thresholds"] is None:
+        return None
+    return {
+        "avg_logprob": stats_mod.DEFAULT_AVG_LOGPROB_THRESHOLD,
+        "no_speech_prob": stats_mod.DEFAULT_NO_SPEECH_PROB_THRESHOLD,
+    }
 
 
 def _build_payload(
@@ -127,17 +236,21 @@ def _build_payload(
     source_file: Path,
     transcribed_at: datetime,
     config: RunConfig,
-    device: str,
-    compute_type: str,
-    detected_language: str,
+    asr_parameters: dict[str, Any],
+    detected_language: str | None,
     language_probability: float | None,
     segments: list[dict[str, Any]],
     processing_seconds: float,
     speaker_clusters: dict[str, Any] | None = None,
     speaker_identities: dict[str, Any] | None = None,
-    batch_size: int | None = None,
 ) -> dict[str, Any]:
     """Build the canonical JSON payload. Used for both aligned and complete stages.
+
+    ``asr_parameters`` is everything under ``parameters`` except
+    ``diarization``: what produced the segments. A fresh run builds it with
+    :func:`_asr_parameters`; a resume carries it from the snapshot
+    (:func:`_snapshot_asr_parameters`), because the ASR did not run again.
+    ``diarization`` always describes the current run.
 
     ``speaker_clusters`` is the per-speaker embedding cache produced by
     :mod:`speaker_embed` after diarization. Aligned-stage and no-diarize-stage
@@ -148,11 +261,9 @@ def _build_payload(
     is ``"auto"`` for DB matches and ``"manual"`` for entries coming from
     the user's ``--speaker-map``.
 
-    ``batch_size`` is the ASR batch that produced the segments; ``None`` when
-    unknown (a resume from a v2 snapshot).
-
     Schema version 2 added both ``speaker_clusters`` and ``speaker_identities``;
-    version 3 added ``parameters.batch_size``.
+    version 3 added ``parameters.batch_size``; version 4 the Parakeet engine
+    (see :data:`SCHEMA_VERSION`).
     Consumers that only look at ``segments`` / ``parameters`` / ``stats``
     (notably :mod:`markdown`) are forward- and backward-compatible without
     changes.
@@ -160,29 +271,18 @@ def _build_payload(
     duration_seconds = float(segments[-1].get("end") or 0.0) if segments else 0.0
     # Annotate segments with `suspect` / `suspect_reasons` before computing the
     # per-speaker breakdown so num_suspect picks them up. Mutates segments in
-    # place; idempotent on resume because the same thresholds always apply.
-    stats_mod.mark_suspect_segments(segments)
+    # place; idempotent on resume because the current defaults always apply
+    # (and are what _applied_suspect_thresholds records). No thresholds, no flags.
+    suspect_thresholds = _applied_suspect_thresholds(asr_parameters)
+    if suspect_thresholds is not None:
+        stats_mod.mark_suspect_segments(segments)
     return {
         "schema_version": SCHEMA_VERSION,
         "stage": stage,
         "source_file": str(source_file),
         "transcribed_at": transcribed_at.isoformat(timespec="seconds"),
         "parameters": {
-            "backend": "whisperx",
-            "asr": f"whisperx-{config.model}",
-            "model": config.model,
-            "device": device,
-            "compute_type": compute_type,
-            "beam_size": config.beam_size,
-            "batch_size": batch_size,
-            "vad_filter": True,
-            "language_forced": config.language,
-            "initial_prompt": config.initial_prompt or None,
-            "hotwords": config.hotwords or None,
-            "anti_loop": config.anti_loop,
-            "condition_on_previous_text": False if config.anti_loop else None,
-            "compression_ratio_threshold": 2.0 if config.anti_loop else None,
-            "no_speech_threshold": 0.5 if config.anti_loop else None,
+            **{k: v for k, v in asr_parameters.items() if k not in ("diarization", "suspect_thresholds")},
             "diarization": {
                 "enabled": config.diarization.enabled,
                 "model_name": config.diarization.model_name,
@@ -190,10 +290,7 @@ def _build_payload(
                 "min_speakers": config.diarization.min_speakers,
                 "max_speakers": config.diarization.max_speakers,
             },
-            "suspect_thresholds": {
-                "avg_logprob": stats_mod.DEFAULT_AVG_LOGPROB_THRESHOLD,
-                "no_speech_prob": stats_mod.DEFAULT_NO_SPEECH_PROB_THRESHOLD,
-            },
+            "suspect_thresholds": suspect_thresholds,
         },
         "audio_info": {
             "language_detected": detected_language,
@@ -215,35 +312,52 @@ def _build_payload(
 
 
 def _resolve_devices(config: RunConfig) -> asr_mod.DevicePlan:
-    """Resolve the devices for the stages that will run, before any heavy work.
+    """Resolve the ASR engine and the devices for the stages that will run, before any heavy work.
 
     The rules live in :func:`asr.plan_devices`, shared with the pre-flight
     check. An explicit ``--device cuda`` that this machine can't honor stops
     the run here, in seconds instead of after hours on CPU, even with
-    ``--no-check``. The returned plan also carries the ASR compute type.
+    ``--no-check``; so do options Parakeet can't apply when it is the
+    engine. The returned plan also carries the ASR compute type (for
+    Parakeet, the ONNX weights: ``float32`` or ``int8``).
     """
     plan = asr_mod.plan_devices(
-        config.device, run_asr=config.runs_asr, run_torch=config.runs_torch
+        config.device,
+        run_asr=config.runs_asr,
+        run_torch=config.diarization.enabled,
+        engine=asr_mod.requested_engine(config.model),
     )
     if plan.error:
         print(f"Error: {plan.error}", file=sys.stderr)
         sys.exit(1)
+    if plan.engine == asr_mod.ENGINE_PARAKEET:
+        conflict = asr_mod.parakeet_conflicts(config, auto_reason=plan.auto_reason)
+        if conflict:
+            print(f"Error: {conflict}", file=sys.stderr)
+            sys.exit(1)
     for note in plan.notes:
         logger.warning(note)
-    if plan.asr:
+    if plan.engine == asr_mod.ENGINE_PARAKEET:
+        weights, warning = parakeet_mod.resolve_weights(config.compute_type)
+        if warning:
+            logger.warning(warning)
+        plan = replace(plan, compute_type=weights)
+    elif plan.asr:
         plan = replace(plan, compute_type=asr_mod.resolve_compute_type(plan.asr, config.compute_type))
     return plan
 
 
 def _configure_threads(config: RunConfig, devices: asr_mod.DevicePlan) -> int | None:
-    """Apply the CPU thread policy; return the thread count for ctranslate2 (or ``None``).
+    """Apply the CPU thread policy; return the thread count for the ASR (or ``None``).
+
+    The ASR count goes to ctranslate2 (whisperX) or ONNX Runtime (Parakeet).
 
     An explicit count applies to every library that runs a stage. It comes
     from ``--threads`` / config ``threads``, else from ``OMP_NUM_THREADS`` /
     ``MKL_NUM_THREADS`` (a limit set in the environment, e.g. on a shared
     server, is honored). Otherwise the default (CPUs - 1) is applied only to
-    the libraries running on CPU: ctranslate2 when the ASR does, torch when
-    any torch work does (VAD, alignment, diarization). A library on the GPU
+    the libraries running on CPU: the ASR library when the ASR does (Parakeet
+    always does), torch when any torch work does (VAD, alignment, diarization). A library on the GPU
     keeps its own default; torch, for instance, defaults to the physical core
     count. A library with no stage to run is left alone.
     """
@@ -254,7 +368,8 @@ def _configure_threads(config: RunConfig, devices: asr_mod.DevicePlan) -> int | 
         source = f" (from {var})"
     explicit = requested is not None
     threads = asr_mod.resolve_cpu_threads(requested)
-    # vad is set only together with asr, and asr implies torch: torch covers it.
+    # whisperX: vad is set only together with asr, and asr implies torch, so
+    # torch covers it. Parakeet: asr is cpu, vad None, torch only if diarizing.
     torch_runs = devices.torch is not None
     asr_threads = (
         threads if devices.asr is not None and (explicit or devices.asr == "cpu") else None
@@ -285,7 +400,12 @@ def _run_asr_and_align(
 
     Side effect: when diarization is enabled, persists the aligned payload to
     ``paths['aligned']`` so a downstream failure doesn't lose the work.
+
+    With Parakeet (``devices.engine``) see :func:`_run_parakeet`: same
+    result, no alignment.
     """
+    if devices.engine == asr_mod.ENGINE_PARAKEET:
+        return _run_parakeet(config, paths=paths, devices=devices, threads=threads)
     input_path = config.input_file.resolve()
     device, compute_type = devices.asr, devices.compute_type
     if device == "cuda":
@@ -293,15 +413,17 @@ def _run_asr_and_align(
     else:
         logger.warning("Running on CPU (compute_type=%s, slower).", compute_type)
 
-    logger.info("Loading whisperX model '%s'...", config.model)
+    model_name = asr_mod.resolve_model_name(config.model, asr_mod.ENGINE_WHISPERX)
+    beam_size = asr_mod.resolve_beam_size(config.beam_size)
+    logger.info("Loading whisperX model '%s'...", model_name)
     asr_options = asr_mod.build_asr_options(
-        beam_size=config.beam_size,
+        beam_size=beam_size,
         initial_prompt=config.initial_prompt,
         hotwords=config.hotwords,
         anti_loop=config.anti_loop,
     )
     model = asr_mod.load_whisperx_model(
-        config.model, device, compute_type, asr_options, threads=threads,
+        model_name, device, compute_type, asr_options, threads=threads,
         vad_device=devices.vad,
     )
     _log_memory("after model load")
@@ -315,7 +437,7 @@ def _run_asr_and_align(
     language_display = config.language if config.language else "(autodetect)"
 
     logger.info("Starting transcription of: %s", input_path.name)
-    logger.info("  beam_size:       %s", config.beam_size)
+    logger.info("  beam_size:       %s", beam_size)
     logger.info("  batch_size:      %s", batch_display)
     logger.info("  language:        %s", language_display)
     logger.info("  initial prompt:  %s", prompt_display)
@@ -350,29 +472,110 @@ def _run_asr_and_align(
     gc.collect()
     _log_memory("after alignment")
     aligned_segments = [_normalize_segment(s) for s in aligned.get("segments", [])]
-    align_time = datetime.now()
-    align_seconds = (align_time - start_time).total_seconds()
-
-    payload = _build_payload(
-        stage=STAGE_ALIGNED,
-        source_file=input_path,
-        transcribed_at=align_time,
-        config=config,
-        device=device,
-        compute_type=compute_type,
+    payload = _aligned_payload(
+        config,
+        paths=paths,
+        asr_parameters=_asr_parameters(
+            config, device=device, compute_type=compute_type, batch_size=batch_size
+        ),
         detected_language=detected_language,
         language_probability=asr_result.get("language_probability"),
         segments=aligned_segments,
-        processing_seconds=align_seconds,
-        batch_size=batch_size,
+        start_time=start_time,
+    )
+    return payload, audio
+
+
+def _run_parakeet(
+    config: RunConfig,
+    *,
+    paths: dict[str, Path],
+    devices: asr_mod.DevicePlan,
+    threads: int | None = None,
+) -> tuple[dict[str, Any], Any]:
+    """Parakeet on CPU (ONNX Runtime); return ``(aligned_payload, audio)`` like the whisperX path.
+
+    Parakeet gives word timestamps itself, so there is no alignment stage.
+    It doesn't report the language: ``language_detected`` is ``null``.
+    """
+    input_path = config.input_file.resolve()
+    weights = devices.compute_type
+    logger.info("Running Parakeet on CPU (ONNX Runtime, %s weights).", weights)
+    logger.info("Loading Parakeet model '%s'...", parakeet_mod.MODEL_NAME)
+    model = parakeet_mod.load_model(weights, threads=threads)
+    _log_memory("after model load")
+    batch_size = asr_mod.resolve_batch_size(config.batch_size, "cpu")
+    batch_display = str(batch_size) if config.batch_size else f"{batch_size} (auto: cpu)"
+
+    logger.info("Starting transcription of: %s", input_path.name)
+    logger.info(
+        "  engine:          Parakeet%s",
+        f" (--model auto: {devices.auto_reason})" if devices.auto_reason else "",
+    )
+    logger.info("  batch_size:      %s", batch_display)
+    logger.info("  language:        (detected by Parakeet)")
+    logger.info("  diarization:     %s", "on" if config.diarization.enabled else "off")
+
+    audio = asr_mod.load_audio(input_path)
+    start_time = datetime.now()
+    result = model.transcribe(audio, batch_size=batch_size)
+    _log_memory("after ASR")
+    del model
+    gc.collect()
+    _log_memory("after freeing the ASR model")
+
+    segments = [_normalize_segment(s) for s in result.get("segments", [])]
+    logger.info("ASR done. %d segments (word timestamps from Parakeet, no alignment).", len(segments))
+    for seg in segments:
+        logger.debug("%s %s", format_timestamp_short(seg["start"]), seg["text"])
+
+    payload = _aligned_payload(
+        config,
+        paths=paths,
+        asr_parameters=_asr_parameters(
+            config,
+            device="cpu",
+            compute_type=weights,
+            batch_size=batch_size,
+            engine=asr_mod.ENGINE_PARAKEET,
+        ),
+        detected_language=None,
+        language_probability=None,
+        segments=segments,
+        start_time=start_time,
+    )
+    return payload, audio
+
+
+def _aligned_payload(
+    config: RunConfig,
+    *,
+    paths: dict[str, Path],
+    asr_parameters: dict[str, Any],
+    detected_language: str | None,
+    language_probability: float | None,
+    segments: list[dict[str, Any]],
+    start_time: datetime,
+) -> dict[str, Any]:
+    """The aligned-stage payload, also written to ``paths['aligned']`` when diarizing."""
+    align_time = datetime.now()
+    payload = _build_payload(
+        stage=STAGE_ALIGNED,
+        source_file=config.input_file.resolve(),
+        transcribed_at=align_time,
+        config=config,
+        asr_parameters=asr_parameters,
+        detected_language=detected_language,
+        language_probability=language_probability,
+        segments=segments,
+        processing_seconds=(align_time - start_time).total_seconds(),
     )
 
     # Free safety net: write the aligned payload before diarization touches anything.
     if config.diarization.enabled:
         write_json(payload, paths["aligned"])
         logger.info("Aligned snapshot saved: %s", paths["aligned"])
-
-    return payload, audio
+    return payload
 
 
 def _has_speakers(payload: dict[str, Any]) -> bool:
@@ -434,7 +637,6 @@ def _diarize_payload(
     decodes the input file here.
     """
     input_path = config.input_file.resolve()
-    asr_device = payload["parameters"].get("device") or "cpu"
 
     logger.info("Running speaker diarization (pyannote)...")
     if audio is None:
@@ -490,15 +692,34 @@ def _diarize_payload(
         source_file=input_path,
         transcribed_at=datetime.now(),
         config=config,
-        device=asr_device,
-        compute_type=payload["parameters"].get("compute_type") or "",
-        detected_language=payload["audio_info"].get("language_detected") or "und",
+        asr_parameters=_snapshot_asr_parameters(payload),
+        detected_language=payload["audio_info"].get("language_detected"),
         language_probability=payload["audio_info"].get("language_probability"),
         segments=diarized_segments,
         processing_seconds=float(payload.get("stats", {}).get("processing_seconds") or 0.0),
         speaker_clusters=speaker_clusters,
         speaker_identities=speaker_identities,
-        batch_size=payload["parameters"].get("batch_size"),
+    )
+
+
+def _complete_without_diarization(payload: dict[str, Any], config: RunConfig) -> dict[str, Any]:
+    """The complete payload of a resumed snapshot when this run doesn't diarize.
+
+    The ASR parameters and timings come from the snapshot, ``diarization``
+    from this run (off). The segments go through :func:`_normalize_segment`,
+    as on the diarization path, so stale ``suspect`` flags are dropped
+    and recomputed.
+    """
+    return _build_payload(
+        stage=STAGE_COMPLETE,
+        source_file=config.input_file.resolve(),
+        transcribed_at=datetime.now(),
+        config=config,
+        asr_parameters=_snapshot_asr_parameters(payload),
+        detected_language=payload["audio_info"].get("language_detected"),
+        language_probability=payload["audio_info"].get("language_probability"),
+        segments=[_normalize_segment(s) for s in payload.get("segments", [])],
+        processing_seconds=float(payload.get("stats", {}).get("processing_seconds") or 0.0),
     )
 
 
@@ -654,6 +875,10 @@ def run_pipeline(config: RunConfig) -> dict[str, Path]:
                     paths["aligned"],
                 )
             raise
+    elif config.resume_from_aligned:
+        # A snapshot without diarization: rebuild, so the result describes this
+        # run (diarization off, current schema), not the snapshot's.
+        final_payload = _complete_without_diarization(aligned_payload, config)
     else:
         # No diarization: promote the aligned payload to "complete" stage as-is.
         final_payload = dict(aligned_payload)

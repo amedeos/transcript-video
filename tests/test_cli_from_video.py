@@ -167,3 +167,22 @@ class TestComputeTypeValue:
         with pytest.raises(SystemExit):
             _run([])
         assert "config 'compute_type' must be one of" in capsys.readouterr().err
+
+
+class TestModelAndBeamDefaults:
+    def test_model_defaults_to_auto(self, captured):
+        _run([])
+        assert captured["config"].model == "auto"
+
+    def test_beam_size_unset_is_none(self, captured):
+        _run([])
+        assert captured["config"].beam_size is None  # whisperX resolves it to 5
+
+    def test_explicit_values(self, captured):
+        _run(["--model", "parakeet", "--beam_size", "3"])
+        assert (captured["config"].model, captured["config"].beam_size) == ("parakeet", 3)
+
+    def test_config_model_key(self, captured, tmp_path):
+        (tmp_path / "transcript-video.toml").write_text('model = "parakeet"\n')
+        _run([])
+        assert captured["config"].model == "parakeet"

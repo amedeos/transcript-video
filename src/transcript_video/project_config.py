@@ -16,6 +16,10 @@ Schema (all keys optional)::
 
     # Top-level keys map directly to argparse ``dest`` names. Anything you can
     # pass on the command line as `--foo-bar VALUE` is settable here as `foo_bar`.
+    # beam_size, anti_loop, hotwords, prompt and language are whisperX options:
+    # with Parakeet (the default --model auto picks it on CPU) they stop the
+    # run, so a config that sets them also pins the whisperX model.
+    model          = "large-v3"
     beam_size      = 10
     anti_loop      = true
     diarize_model  = "pyannote/speaker-diarization-3.1"

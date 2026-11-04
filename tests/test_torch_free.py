@@ -26,6 +26,8 @@ BLOCKED_PREFIXES = (
     "transformers",
     "ctranslate2",
     "faster_whisper",
+    "onnx_asr",
+    "onnxruntime",
 )
 
 # Modules that must remain torch-free.

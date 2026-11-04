@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from transcript_video import pipeline as pipeline_mod
+from transcript_video import stats as stats_mod
 from transcript_video.config import (
     DiarizationConfig,
     FrontmatterConfig,
@@ -110,6 +112,37 @@ def stub_pipeline(monkeypatch, fake_audio):
         pipeline_mod.speaker_embed_mod, "extract_cluster_embeddings", _fake_extract
     )
 
+    parakeet_calls: dict = {}
+
+    class FakeParakeet:
+        # Same signature as parakeet.ParakeetModel.transcribe.
+        def transcribe(self, audio, *, batch_size):
+            parakeet_calls["batch_size"] = batch_size
+            return {
+                "language": None,
+                "segments": [
+                    {
+                        "start": 0.0, "end": 1.2, "text": "Ciao a tutti.", "token_logprob": -0.1,
+                        "words": [
+                            {"word": "Ciao", "start": 0.0, "end": 0.4, "logprob": -0.05},
+                            {"word": "a", "start": 0.4, "end": 0.6, "logprob": -0.2},
+                            {"word": "tutti.", "start": 0.6, "end": 1.2, "logprob": -0.1},
+                        ],
+                    },
+                    {
+                        "start": 2.5, "end": 3.5, "text": "Iniziamo.", "token_logprob": -0.3,
+                        "words": [{"word": "Iniziamo.", "start": 2.5, "end": 3.5, "logprob": -0.3}],
+                    },
+                ],
+            }
+
+    def _fake_load_parakeet(compute_type, threads=None):
+        parakeet_calls["load"] = {"compute_type": compute_type, "threads": threads}
+        return FakeParakeet()
+
+    monkeypatch.setattr(pipeline_mod.parakeet_mod, "load_model", _fake_load_parakeet)
+    return SimpleNamespace(parakeet=parakeet_calls)
+
 
 def _config(input_file: Path, *, write_md=True) -> RunConfig:
     return RunConfig(
@@ -139,11 +172,11 @@ class TestRunPipelineHappyPath:
         md = written["md"].read_text(encoding="utf-8")
         assert "## [00:00:00] SPEAKER_00" in md
 
-    def test_schema_version_is_three_with_batch_size(self, stub_pipeline, fake_input):
+    def test_schema_version_is_four_with_batch_size(self, stub_pipeline, fake_input):
         config = _config(fake_input, write_md=False)
         written = pipeline_mod.run_pipeline(config)
         final = json.loads(written["json"].read_text(encoding="utf-8"))
-        assert final["schema_version"] == 3
+        assert final["schema_version"] == 4
         assert final["parameters"]["batch_size"] == 16  # stub_pipeline runs on cuda
 
     def test_resume_keeps_the_snapshot_batch_size(self, stub_pipeline, fake_input, tmp_path):
@@ -155,6 +188,97 @@ class TestRunPipelineHappyPath:
         resume.resume_from_aligned = tmp_path / "video_transcript.aligned.json"
         final = json.loads(pipeline_mod.run_pipeline(resume)["json"].read_text(encoding="utf-8"))
         assert final["parameters"]["batch_size"] == 2
+
+    def test_resume_keeps_the_snapshot_asr_parameters(self, stub_pipeline, fake_input, tmp_path):
+        """The ASR didn't run again: the current run's ASR flags must not relabel it."""
+        config = _config(fake_input, write_md=False)
+        config.model = "large-v3"
+        config.language = "it"
+        config.initial_prompt = "Collaudo, sviluppo."
+        config.beam_size = 10
+        pipeline_mod.run_pipeline(config)
+        snap = json.loads((tmp_path / "video_transcript.aligned.json").read_text(encoding="utf-8"))
+
+        resume = _config(fake_input, write_md=False)
+        resume.model = "small"
+        resume.language = "en"
+        resume.initial_prompt = None
+        resume.beam_size = 1
+        resume.compute_type = "int8"
+        resume.diarization = DiarizationConfig(enabled=True, hf_token="hf_fake", num_speakers=3)
+        resume.resume_from_aligned = tmp_path / "video_transcript.aligned.json"
+        final = json.loads(pipeline_mod.run_pipeline(resume)["json"].read_text(encoding="utf-8"))
+
+        params = final["parameters"]
+        expected = {k: v for k, v in snap["parameters"].items() if k != "diarization"}
+        assert {k: v for k, v in params.items() if k != "diarization"} == expected
+        assert params["model"] == "large-v3"
+        assert params["asr"] == "whisperx-large-v3"
+        assert params["language_forced"] == "it"
+        assert params["initial_prompt"] == "Collaudo, sviluppo."
+        assert params["beam_size"] == 10
+        # diarization describes the run that diarized
+        assert params["diarization"]["num_speakers"] == 3
+
+    def test_resume_without_diarization_describes_this_run(self, stub_pipeline, fake_input, tmp_path):
+        """A snapshot (written because diarization was on) resumed with --no-diarize."""
+        config = _config(fake_input, write_md=False)
+        config.model = "large-v3"
+        pipeline_mod.run_pipeline(config)
+        snap_path = tmp_path / "video_transcript.aligned.json"
+        snap = json.loads(snap_path.read_text(encoding="utf-8"))
+        assert snap["parameters"]["diarization"]["enabled"] is True
+        snap["schema_version"] = 2
+        snap["segments"][0]["suspect"] = True  # a stale flag
+        snap["segments"][0]["suspect_reasons"] = ["old threshold"]
+        snap_path.write_text(json.dumps(snap), encoding="utf-8")
+
+        resume = _config(fake_input, write_md=False)
+        resume.model = "small"
+        resume.diarization = DiarizationConfig(enabled=False)
+        resume.resume_from_aligned = snap_path
+        final = json.loads(pipeline_mod.run_pipeline(resume)["json"].read_text(encoding="utf-8"))
+
+        assert final["stage"] == "complete"
+        assert final["schema_version"] == pipeline_mod.SCHEMA_VERSION
+        assert final["parameters"]["diarization"]["enabled"] is False
+        assert final["parameters"]["model"] == "large-v3"  # from the snapshot
+        assert "suspect" not in final["segments"][0]
+        assert final["stats"]["num_suspect"] == 0
+
+    def test_resume_records_the_thresholds_it_applies(self, stub_pipeline, fake_input, tmp_path):
+        pipeline_mod.run_pipeline(_config(fake_input, write_md=False))
+        snap_path = tmp_path / "video_transcript.aligned.json"
+        snap = json.loads(snap_path.read_text(encoding="utf-8"))
+        snap["parameters"]["suspect_thresholds"] = {"avg_logprob": -5.0, "no_speech_prob": 0.99}
+        snap_path.write_text(json.dumps(snap), encoding="utf-8")
+
+        resume = _config(fake_input, write_md=False)
+        resume.resume_from_aligned = snap_path
+        final = json.loads(pipeline_mod.run_pipeline(resume)["json"].read_text(encoding="utf-8"))
+        assert final["parameters"]["suspect_thresholds"] == {
+            "avg_logprob": stats_mod.DEFAULT_AVG_LOGPROB_THRESHOLD,
+            "no_speech_prob": stats_mod.DEFAULT_NO_SPEECH_PROB_THRESHOLD,
+        }
+
+    def test_null_suspect_thresholds_stay_null(self, fake_input):
+        cfg = _config(fake_input)
+        params = pipeline_mod._asr_parameters(cfg, device="cpu", compute_type="float32", batch_size=4)
+        params["suspect_thresholds"] = None  # an ASR without whisperX-style confidences
+        payload = pipeline_mod._build_payload(
+            stage=pipeline_mod.STAGE_COMPLETE,
+            source_file=fake_input,
+            transcribed_at=__import__("datetime").datetime(2026, 11, 4, 10, 0, 0),
+            config=cfg,
+            asr_parameters=params,
+            detected_language="und",
+            language_probability=None,
+            segments=[{"start": 0.0, "end": 1.0, "text": "x", "avg_logprob": -9.0}],
+            processing_seconds=1.0,
+        )
+        assert payload["parameters"]["suspect_thresholds"] is None
+        assert "suspect" not in payload["segments"][0]  # no thresholds, no flags
+        assert payload["stats"]["num_suspect"] == 0
 
     def test_resume_from_v2_snapshot_has_unknown_batch_size(
         self, stub_pipeline, fake_input, tmp_path
@@ -169,7 +293,7 @@ class TestRunPipelineHappyPath:
         resume = _config(fake_input, write_md=False)
         resume.resume_from_aligned = snap_path
         final = json.loads(pipeline_mod.run_pipeline(resume)["json"].read_text(encoding="utf-8"))
-        assert final["schema_version"] == 3
+        assert final["schema_version"] == pipeline_mod.SCHEMA_VERSION
         assert final["parameters"]["batch_size"] is None
 
     def test_speaker_clusters_cached_in_complete_payload(self, stub_pipeline, fake_input):
@@ -192,7 +316,7 @@ class TestRunPipelineHappyPath:
             (tmp_path / "video_transcript.aligned.json").read_text(encoding="utf-8")
         )
         # Aligned stage runs before diarization → no clusters.
-        assert aligned["schema_version"] == 3
+        assert aligned["schema_version"] == pipeline_mod.SCHEMA_VERSION
         assert aligned["speaker_clusters"] == {}
 
     def test_no_diarize_skips_aligned_snapshot(self, stub_pipeline, fake_input, tmp_path):
@@ -630,7 +754,9 @@ class TestThreads:
 
         monkeypatch.setattr(pipeline_mod.asr_mod, "load_whisperx_model", _fake_load)
 
-        pipeline_mod.run_pipeline(_config(fake_input, write_md=False))
+        config = _config(fake_input, write_md=False)
+        config.model = "large-v3"  # whisperX on CPU (auto would pick Parakeet)
+        pipeline_mod.run_pipeline(config)
 
         assert seen == {"torch": 7, "asr": 7}
 
@@ -780,6 +906,7 @@ class TestBatchSize:
     def test_cpu_default_is_4(self, stub_pipeline, seen_batch, fake_input, monkeypatch):
         self._on_cpu(monkeypatch)
         config = _config(fake_input, write_md=False)
+        config.model = "large-v3"
         config.beam_size = 10
         pipeline_mod.run_pipeline(config)
         assert seen_batch == {"batch_size": 4}
@@ -787,6 +914,7 @@ class TestBatchSize:
     def test_explicit_batch_size_wins_on_cpu(self, stub_pipeline, seen_batch, fake_input, monkeypatch):
         self._on_cpu(monkeypatch)
         config = _config(fake_input, write_md=False)
+        config.model = "large-v3"
         config.beam_size = 10
         config.batch_size = 3
         pipeline_mod.run_pipeline(config)
@@ -860,8 +988,9 @@ class TestPayloadConstruction:
             source_file=fake_input,
             transcribed_at=__import__("datetime").datetime(2026, 5, 5, 10, 0, 0),
             config=cfg,
-            device="cuda",
-            compute_type="float16",
+            asr_parameters=pipeline_mod._asr_parameters(
+                cfg, device="cuda", compute_type="float16", batch_size=None
+            ),
             detected_language="it",
             language_probability=0.95,
             segments=[{"start": 0.0, "end": 2.0, "text": "Ciao"}],
@@ -878,8 +1007,9 @@ class TestPayloadConstruction:
             source_file=fake_input,
             transcribed_at=__import__("datetime").datetime(2026, 5, 5, 10, 0, 0),
             config=cfg,
-            device="cuda",
-            compute_type="float16",
+            asr_parameters=pipeline_mod._asr_parameters(
+                cfg, device="cuda", compute_type="float16", batch_size=None
+            ),
             detected_language="it",
             language_probability=0.95,
             segments=[
@@ -971,3 +1101,134 @@ class TestResolveDiarizationApi:
         kwargs = _build_pipeline_init_kwargs(OldApi, "hf_xxx", "cuda", None)
         assert kwargs["use_auth_token"] == "hf_xxx"
         assert "token" not in kwargs
+
+
+class TestParakeetEngine:
+    """--model auto on a CPU-only machine, and --model parakeet anywhere."""
+
+    @staticmethod
+    def _cpu_only(monkeypatch):
+        monkeypatch.setattr(pipeline_mod.asr_mod, "check_cuda_available", lambda: (False, None))
+        monkeypatch.setattr(pipeline_mod.asr_mod, "torch_cuda_available", lambda: False)
+
+    @staticmethod
+    def _no_alignment(monkeypatch):
+        def _align(*a, **kw):
+            raise AssertionError("Parakeet segments must not be aligned")
+
+        monkeypatch.setattr(pipeline_mod.asr_mod, "align_segments", _align)
+
+    def test_auto_on_cpu_runs_parakeet_without_alignment(
+        self, stub_pipeline, fake_input, tmp_path, monkeypatch
+    ):
+        self._cpu_only(monkeypatch)
+        self._no_alignment(monkeypatch)
+        monkeypatch.setattr(pipeline_mod.asr_mod, "available_cpu_count", lambda: 8)
+        written = pipeline_mod.run_pipeline(_config(fake_input, write_md=False))
+        final = json.loads(written["json"].read_text(encoding="utf-8"))
+
+        assert stub_pipeline.parakeet["load"] == {"compute_type": "float32", "threads": 7}
+        assert stub_pipeline.parakeet["batch_size"] == 4
+        params = final["parameters"]
+        assert params["backend"] == "onnx-asr"
+        assert params["asr"] == "onnx-asr-parakeet-tdt-0.6b-v3"
+        assert params["model"] == "parakeet-tdt-0.6b-v3"
+        assert params["model_revision"] == pipeline_mod.parakeet_mod.HF_REVISION
+        assert (params["device"], params["compute_type"], params["batch_size"]) == ("cpu", "float32", 4)
+        assert params["vad"]["min_silence_ms"] == 1000
+        for key in ("beam_size", "language_forced", "initial_prompt", "hotwords", "anti_loop",
+                    "suspect_thresholds"):
+            assert params[key] is None, key
+        assert final["audio_info"]["language_detected"] is None
+        assert final["schema_version"] == 4
+        seg = final["segments"][0]
+        assert seg["token_logprob"] == -0.1
+        word = seg["words"][0]
+        assert (word["word"], word["start"], word["end"], word["logprob"]) == ("Ciao", 0.0, 0.4, -0.05)
+        assert "score" not in word
+        assert "suspect" not in seg and final["stats"]["num_suspect"] == 0
+        assert (tmp_path / "video_transcript.aligned.json").exists()  # snapshot written
+
+    def test_explicit_parakeet_on_a_gpu_machine_keeps_diarization_on_the_gpu(
+        self, stub_pipeline, fake_input, monkeypatch
+    ):
+        seen = {}
+        real = pipeline_mod.diarize_mod.diarize_and_assign
+
+        def _diarize(aligned, audio, **kwargs):
+            seen["device"] = kwargs.get("device")
+            return real(aligned, audio, **kwargs)
+
+        monkeypatch.setattr(pipeline_mod.diarize_mod, "diarize_and_assign", _diarize)
+        monkeypatch.setattr(pipeline_mod.asr_mod, "available_cpu_count", lambda: 8)
+        self._no_alignment(monkeypatch)
+        config = _config(fake_input, write_md=False)
+        config.model = "parakeet"
+        final = json.loads(pipeline_mod.run_pipeline(config)["json"].read_text(encoding="utf-8"))
+        assert final["parameters"]["device"] == "cpu"
+        assert seen["device"] == "cuda"
+        assert stub_pipeline.parakeet["load"]["threads"] == 7  # Parakeet is on CPU: CPUs - 1
+
+    def test_auto_on_a_float16_gpu_stays_whisperx(self, stub_pipeline, fake_input):
+        final = json.loads(
+            pipeline_mod.run_pipeline(_config(fake_input, write_md=False))["json"].read_text(encoding="utf-8")
+        )
+        assert final["parameters"]["model"] == "large-v3"
+        assert final["parameters"]["beam_size"] == 5
+        assert "load" not in stub_pipeline.parakeet
+
+    def test_int8_compute_type_selects_int8_weights(self, stub_pipeline, fake_input, monkeypatch):
+        self._cpu_only(monkeypatch)
+        config = _config(fake_input, write_md=False)
+        config.compute_type = "int8"
+        final = json.loads(pipeline_mod.run_pipeline(config)["json"].read_text(encoding="utf-8"))
+        assert stub_pipeline.parakeet["load"]["compute_type"] == "int8"
+        assert final["parameters"]["compute_type"] == "int8"
+
+    @pytest.mark.parametrize(
+        "field, value, shown",
+        [
+            ("language", "it", "--language it"),
+            ("initial_prompt", "Collaudo", "--prompt"),
+            ("hotwords", "sandbox", "--hotwords"),
+            ("beam_size", 10, "--beam_size 10"),
+            ("anti_loop", True, "--anti-loop"),
+        ],
+    )
+    def test_options_parakeet_cant_apply_stop_the_run(
+        self, stub_pipeline, fake_input, monkeypatch, capsys, field, value, shown
+    ):
+        self._cpu_only(monkeypatch)
+        config = _config(fake_input, write_md=False)
+        setattr(config, field, value)
+        with pytest.raises(SystemExit) as exc:
+            pipeline_mod.run_pipeline(config)
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert shown in err
+        assert "--model auto chose Parakeet" in err
+        assert "--model large-v3" in err
+        assert "load" not in stub_pipeline.parakeet  # stopped before loading anything
+
+    def test_explicitly_disabled_prompt_is_fine(self, stub_pipeline, fake_input, monkeypatch):
+        self._cpu_only(monkeypatch)
+        config = _config(fake_input, write_md=False)
+        config.model = "parakeet"
+        config.initial_prompt = ""
+        config.hotwords = ""
+        pipeline_mod.run_pipeline(config)
+        assert "load" in stub_pipeline.parakeet
+
+    def test_resume_of_a_parakeet_snapshot_ignores_the_current_asr_flags(
+        self, stub_pipeline, fake_input, tmp_path, monkeypatch
+    ):
+        self._cpu_only(monkeypatch)
+        pipeline_mod.run_pipeline(_config(fake_input, write_md=False))
+        resume = _config(fake_input, write_md=False)
+        resume.model = "large-v3"
+        resume.language = "it"  # no ASR runs: no conflict
+        resume.resume_from_aligned = tmp_path / "video_transcript.aligned.json"
+        final = json.loads(pipeline_mod.run_pipeline(resume)["json"].read_text(encoding="utf-8"))
+        assert final["parameters"]["model"] == "parakeet-tdt-0.6b-v3"
+        assert final["parameters"]["suspect_thresholds"] is None
+        assert final["audio_info"]["language_detected"] is None

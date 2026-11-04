@@ -12,12 +12,14 @@ when something is not OK.
 
 from __future__ import annotations
 
+import importlib.metadata
 import logging
 import shutil
 from dataclasses import dataclass
 
 from . import asr as asr_mod
 from . import diarize as diarize_mod
+from . import parakeet as parakeet_mod
 from . import speaker_db as speaker_db_mod
 from . import speaker_embed as speaker_embed_mod
 from .config import RunConfig
@@ -46,7 +48,11 @@ def check_ffmpeg() -> CheckResult:
 
 
 def check_cuda(
-    device_request: str | None, *, run_asr: bool = True, run_torch: bool = True
+    device_request: str | None,
+    *,
+    run_asr: bool = True,
+    run_torch: bool = True,
+    engine: str = asr_mod.ENGINE_WHISPERX,
 ) -> CheckResult:
     """Verify the requested device can be honored for the stages that will run.
 
@@ -54,15 +60,32 @@ def check_cuda(
     pre-flight verdict and the actual run can't disagree. An explicit ``cuda``
     fails unless every library that will run can use it. ``auto`` never fails:
     whichever library lacks CUDA runs on CPU. ``run_asr=False`` (resume) skips
-    the ctranslate2 requirement; with ``run_torch=False`` too, nothing needs a
-    device.
+    the ctranslate2 requirement; with ``run_torch=False`` too (no
+    diarization), nothing needs a device. ``engine`` is the requested ASR
+    engine (:func:`asr.requested_engine`): Parakeet needs no ctranslate2.
     """
     if (device_request or "auto").lower() == "cpu":
         return CheckResult("cuda", True, "skipped (--device cpu)")
+    plan = asr_mod.plan_devices(device_request, run_asr=run_asr, run_torch=run_torch, engine=engine)
+    return _cuda_result(plan, device_request)
 
-    plan = asr_mod.plan_devices(device_request, run_asr=run_asr, run_torch=run_torch)
+
+def _cuda_result(plan: asr_mod.DevicePlan, device_request: str | None) -> CheckResult:
+    """The ``cuda`` check's verdict for a plan (see :func:`check_cuda`)."""
+    if (device_request or "auto").lower() == "cpu":
+        return CheckResult("cuda", True, "skipped (--device cpu)")
     if plan.error:
         return CheckResult("cuda", False, plan.error)
+    if plan.engine == asr_mod.ENGINE_PARAKEET:
+        # Parakeet is on CPU by design, not for lack of a GPU: only torch counts.
+        notes = " ".join(plan.notes)
+        if plan.torch == "cuda":
+            message = "available: diarization on cuda (Parakeet ASR runs on cpu by design)"
+        elif plan.torch == "cpu":
+            message = "not available for diarization (cpu, slower); Parakeet ASR runs on cpu by design"
+        else:
+            message = "not needed: Parakeet runs on cpu and there is no diarization"
+        return CheckResult("cuda", True, f"{message}. {notes}".strip() if notes else message)
 
     used = {d for d in (plan.asr, plan.torch, plan.vad) if d}
     if not used:
@@ -287,6 +310,74 @@ def check_embedding_model_access(token: str | None, model_id: str | None) -> Che
     return CheckResult("embedding_model_access", True, f"accessible: {target}")
 
 
+def check_asr_engine(config: RunConfig, plan: asr_mod.DevicePlan) -> CheckResult:
+    """Report the ASR engine that will run, and why; FAIL on options Parakeet can't apply."""
+    how = f" (--model auto: {plan.auto_reason})" if plan.auto_reason else ""
+    if plan.engine == asr_mod.ENGINE_PARAKEET:
+        conflict = asr_mod.parakeet_conflicts(config, auto_reason=plan.auto_reason)
+        if conflict:
+            return CheckResult("asr_engine", False, conflict)
+        return CheckResult("asr_engine", True, f"Parakeet {parakeet_mod.MODEL_NAME} on cpu{how}")
+    model = asr_mod.resolve_model_name(config.model, asr_mod.ENGINE_WHISPERX)
+    return CheckResult("asr_engine", True, f"whisperX {model} on {plan.asr}{how}")
+
+
+def check_parakeet(compute_type: str | None, *, network: bool) -> CheckResult:
+    """onnx-asr importable at a supported version, ONNX Runtime's CPU provider, model files.
+
+    Missing model files are not a failure (the first run downloads them),
+    but with ``network`` each one is looked up at its pinned revision: an
+    offline machine learns it now, not after audio decoding. Any error,
+    an import included (a broken native wheel raises more than
+    ImportError), becomes a FAIL line instead of a traceback.
+    """
+    name = "parakeet"
+    try:
+        import onnx_asr  # noqa: F401
+        import onnxruntime as ort
+
+        providers = ort.get_available_providers()
+    except Exception as e:
+        return CheckResult(
+            name, False,
+            f"onnx-asr / onnxruntime not usable: {type(e).__name__}: {e}. "
+            "Reinstall with `uv pip install -e .`.",
+        )
+    try:
+        version = importlib.metadata.version("onnx-asr")
+    except importlib.metadata.PackageNotFoundError:
+        version = None
+    if version is not None and not version.startswith(parakeet_mod.ONNX_ASR_SERIES):
+        return CheckResult(
+            name, False, f"onnx-asr {version} installed; this transcript-video needs {parakeet_mod.ONNX_ASR_SERIES}x"
+        )
+    if "CPUExecutionProvider" not in providers:
+        return CheckResult(name, False, "ONNX Runtime has no CPUExecutionProvider")
+    weights, _ = parakeet_mod.resolve_weights(compute_type)
+    label = f"onnx-asr {version or '(version unknown)'}, {weights} weights"
+    try:
+        missing = parakeet_mod.missing_files(weights)
+    except Exception as e:
+        return CheckResult(name, False, f"{label}: can't read the model cache: {type(e).__name__}: {e}")
+    if not missing:
+        return CheckResult(name, True, f"{label} ready")
+    download = (
+        f"the first run downloads {len(missing)} file(s) "
+        f"(~{parakeet_mod.download_estimate(weights, missing)}) from huggingface.co"
+    )
+    if network:
+        try:
+            from huggingface_hub import file_exists
+
+            absent = [f"{repo}/{file}" for repo, revision, file in missing
+                      if not file_exists(repo, file, revision=revision)]
+        except Exception as e:
+            return CheckResult(name, False, f"{download}, but it is not reachable: {type(e).__name__}: {e}")
+        if absent:
+            return CheckResult(name, False, f"not found at the pinned revision: {', '.join(absent)}")
+    return CheckResult(name, True, f"{label}: {download}")
+
+
 def run_preflight(config: RunConfig, *, network: bool = True) -> list[CheckResult]:
     """Run all checks relevant to ``config``. Cheap checks first, network last.
 
@@ -295,9 +386,18 @@ def run_preflight(config: RunConfig, *, network: bool = True) -> list[CheckResul
     """
     results: list[CheckResult] = []
     results.append(check_ffmpeg())
-    results.append(
-        check_cuda(config.device, run_asr=config.runs_asr, run_torch=config.runs_torch)
+    # One plan for the device and engine checks: the same rules as the pipeline.
+    plan = asr_mod.plan_devices(
+        config.device,
+        run_asr=config.runs_asr,
+        run_torch=config.diarization.enabled,
+        engine=asr_mod.requested_engine(config.model),
     )
+    results.append(_cuda_result(plan, config.device))
+    if plan.engine is not None:  # an ASR runs (not a resume) and the plan holds
+        results.append(check_asr_engine(config, plan))
+        if plan.engine == asr_mod.ENGINE_PARAKEET:
+            results.append(check_parakeet(config.compute_type, network=network))
     results.append(check_whisperx_api())
 
     if not config.diarization.enabled:

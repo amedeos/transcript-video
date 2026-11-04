@@ -599,3 +599,129 @@ class TestLoadWhisperxModelThreads:
         self._install_fake_whisperx(monkeypatch, load_model)
         assert asr.load_whisperx_model("large-v3", "cpu", "float32", {"beam_size": 5}, threads=7) == "model"
         assert calls == {"device": "cpu", "compute_type": "float32"}
+
+
+class TestEngineSelection:
+    """--model auto / parakeet / whisper names, and where each engine runs."""
+
+    @pytest.mark.parametrize(
+        "model, engine",
+        [(None, "auto"), ("auto", "auto"), ("AUTO", "auto"), ("parakeet", "parakeet"),
+         ("parakeet-tdt-0.6b-v3", "parakeet"), ("large-v3", "whisperx"), ("small", "whisperx")],
+    )
+    def test_requested_engine(self, model, engine):
+        assert asr.requested_engine(model) == engine
+
+    def test_resolve_model_name(self):
+        assert asr.resolve_model_name("auto", asr.ENGINE_WHISPERX) == "large-v3"
+        assert asr.resolve_model_name("small", asr.ENGINE_WHISPERX) == "small"
+        assert asr.resolve_model_name("auto", asr.ENGINE_PARAKEET) == "parakeet-tdt-0.6b-v3"
+        assert asr.resolve_model_name("Parakeet", asr.ENGINE_PARAKEET) == "parakeet-tdt-0.6b-v3"
+
+    def test_resolve_beam_size(self):
+        assert asr.resolve_beam_size(None) == 5
+        assert asr.resolve_beam_size(10) == 10
+
+    @staticmethod
+    def _gpu(monkeypatch, *, ct2, torch, hint="float16"):
+        monkeypatch.setattr(asr, "check_cuda_available", lambda: (ct2, hint if ct2 else None))
+        monkeypatch.setattr(asr, "torch_cuda_available", lambda: torch)
+
+    def test_auto_on_a_float16_gpu_is_whisperx_on_cuda(self, monkeypatch):
+        self._gpu(monkeypatch, ct2=True, torch=True)
+        plan = asr.plan_devices("auto", run_asr=True, run_torch=True, engine="auto")
+        assert (plan.engine, plan.asr, plan.torch, plan.vad) == ("whisperx", "cuda", "cuda", "cuda")
+        assert plan.auto_reason == "float16 GPU"
+
+    def test_auto_mixed_devices_keep_whisperx_when_its_asr_stays_on_cuda(self, monkeypatch):
+        self._gpu(monkeypatch, ct2=True, torch=False)
+        monkeypatch.setattr(asr, "cpu_vad_supported", lambda: True)
+        plan = asr.plan_devices("auto", run_asr=True, run_torch=True, engine="auto")
+        assert (plan.engine, plan.asr, plan.vad, plan.torch) == ("whisperx", "cuda", "cpu", "cpu")
+
+    def test_auto_is_parakeet_when_the_whisperx_asr_would_fall_back_to_cpu(self, monkeypatch):
+        """A float16 GPU, but torch can't use CUDA and whisperX can't split its VAD off."""
+        self._gpu(monkeypatch, ct2=True, torch=False)
+        monkeypatch.setattr(asr, "cpu_vad_supported", lambda: False)
+        plan = asr.plan_devices("auto", run_asr=True, run_torch=True, engine="auto")
+        assert (plan.engine, plan.asr, plan.vad, plan.torch) == ("parakeet", "cpu", None, "cpu")
+        assert "VAD apart" in plan.auto_reason
+        assert "--model large-v3" in plan.notes[0]
+
+    def test_explicit_parakeet_has_no_auto_reason(self, monkeypatch):
+        self._gpu(monkeypatch, ct2=False, torch=False)
+        assert asr.plan_devices("auto", run_asr=True, run_torch=False, engine="parakeet").auto_reason is None
+
+    def test_auto_without_gpu_is_parakeet_with_no_torch_vad(self, monkeypatch):
+        self._gpu(monkeypatch, ct2=False, torch=False)
+        plan = asr.plan_devices("auto", run_asr=True, run_torch=True, engine="auto")
+        assert (plan.engine, plan.asr, plan.torch, plan.vad) == ("parakeet", "cpu", "cpu", None)
+        assert plan.notes == ()  # a CPU-only machine is not worth a warning
+        assert plan.auto_reason == "no CUDA GPU for the whisperX ASR"
+
+    def test_auto_with_device_cpu_is_parakeet_without_probing(self, monkeypatch):
+        def no_probe():
+            raise AssertionError("no CUDA probe for --device cpu")
+
+        monkeypatch.setattr(asr, "check_cuda_available", no_probe)
+        plan = asr.plan_devices("cpu", run_asr=True, run_torch=False, engine="auto")
+        assert (plan.engine, plan.asr, plan.torch) == ("parakeet", "cpu", None)
+        assert plan.auto_reason == "--device cpu"
+
+    def test_auto_on_a_gpu_below_float16_is_parakeet_with_a_note(self, monkeypatch):
+        self._gpu(monkeypatch, ct2=True, torch=True, hint="float32")
+        plan = asr.plan_devices("auto", run_asr=True, run_torch=True, engine="auto")
+        assert (plan.engine, plan.asr, plan.torch) == ("parakeet", "cpu", "cuda")
+        assert "--model large-v3 --device cuda" in plan.notes[0]
+
+    def test_auto_with_explicit_cuda_and_no_gpu_is_an_error_not_parakeet(self, monkeypatch):
+        self._gpu(monkeypatch, ct2=False, torch=False)
+        plan = asr.plan_devices("cuda", run_asr=True, run_torch=True, engine="auto")
+        assert plan.error and "ASR (ctranslate2)" in plan.error
+        assert plan.engine is None
+
+    def test_parakeet_needs_no_torch_without_diarization(self, monkeypatch):
+        self._gpu(monkeypatch, ct2=True, torch=True)
+        plan = asr.plan_devices("auto", run_asr=True, run_torch=False, engine="parakeet")
+        assert (plan.engine, plan.asr, plan.torch, plan.vad) == ("parakeet", "cpu", None, None)
+
+    def test_parakeet_with_explicit_cuda_diarizes_on_the_gpu(self, monkeypatch):
+        self._gpu(monkeypatch, ct2=True, torch=True)
+        plan = asr.plan_devices("cuda", run_asr=True, run_torch=True, engine="parakeet")
+        assert (plan.asr, plan.torch, plan.error) == ("cpu", "cuda", None)
+        assert "applies to diarization" in plan.notes[0]
+
+    def test_parakeet_with_explicit_cuda_and_no_torch_cuda_is_an_error(self, monkeypatch):
+        self._gpu(monkeypatch, ct2=True, torch=False)
+        plan = asr.plan_devices("cuda", run_asr=True, run_torch=True, engine="parakeet")
+        assert plan.error and "diarization (torch)" in plan.error
+
+    def test_resume_has_no_engine(self, monkeypatch):
+        self._gpu(monkeypatch, ct2=True, torch=True)
+        plan = asr.plan_devices("auto", run_asr=False, run_torch=True, engine="auto")
+        assert (plan.engine, plan.asr, plan.torch) == (None, None, "cuda")
+
+
+class TestParakeetConflicts:
+    def _cfg(self, **kw):
+        base = dict(language=None, initial_prompt=None, hotwords=None, beam_size=None, anti_loop=False)
+        return types.SimpleNamespace(**{**base, **kw})
+
+    def test_nothing_set(self):
+        assert asr.parakeet_conflicts(self._cfg(), auto_reason="--device cpu") is None
+
+    def test_explicitly_disabled_prompt_and_hotwords_are_fine(self):
+        assert asr.parakeet_conflicts(self._cfg(initial_prompt="", hotwords="")) is None
+
+    def test_every_option_is_named(self):
+        msg = asr.parakeet_conflicts(
+            self._cfg(language="it", initial_prompt="x", hotwords="y", beam_size=10, anti_loop=True),
+        )
+        for shown in ("--language it", "--prompt", "--hotwords", "--beam_size 10", "--anti-loop",
+                      "--model large-v3"):
+            assert shown in msg
+        assert "auto chose" not in msg
+
+    def test_auto_explains_the_choice(self):
+        msg = asr.parakeet_conflicts(self._cfg(language="it"), auto_reason="--device cpu")
+        assert "--model auto chose Parakeet (--device cpu)" in msg
