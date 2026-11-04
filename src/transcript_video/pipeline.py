@@ -161,6 +161,22 @@ def _snapshot_asr_parameters(payload: dict[str, Any]) -> dict[str, Any]:
     return asr
 
 
+def _applied_suspect_thresholds(asr_parameters: dict[str, Any]) -> dict[str, float] | None:
+    """The thresholds :func:`stats.mark_suspect_segments` applies in this run, as recorded.
+
+    The flags are always recomputed with the current defaults (a resume
+    included), so the record must be the current defaults too, not a
+    snapshot's copy. ``None`` stays ``None``: an ASR that records it has no
+    confidences these thresholds can read, and no segment gets flagged.
+    """
+    if "suspect_thresholds" in asr_parameters and asr_parameters["suspect_thresholds"] is None:
+        return None
+    return {
+        "avg_logprob": stats_mod.DEFAULT_AVG_LOGPROB_THRESHOLD,
+        "no_speech_prob": stats_mod.DEFAULT_NO_SPEECH_PROB_THRESHOLD,
+    }
+
+
 def _build_payload(
     *,
     stage: str,
@@ -201,8 +217,11 @@ def _build_payload(
     duration_seconds = float(segments[-1].get("end") or 0.0) if segments else 0.0
     # Annotate segments with `suspect` / `suspect_reasons` before computing the
     # per-speaker breakdown so num_suspect picks them up. Mutates segments in
-    # place; idempotent on resume because the same thresholds always apply.
-    stats_mod.mark_suspect_segments(segments)
+    # place; idempotent on resume because the current defaults always apply
+    # (and are what _applied_suspect_thresholds records). No thresholds, no flags.
+    suspect_thresholds = _applied_suspect_thresholds(asr_parameters)
+    if suspect_thresholds is not None:
+        stats_mod.mark_suspect_segments(segments)
     return {
         "schema_version": SCHEMA_VERSION,
         "stage": stage,
@@ -217,7 +236,7 @@ def _build_payload(
                 "min_speakers": config.diarization.min_speakers,
                 "max_speakers": config.diarization.max_speakers,
             },
-            "suspect_thresholds": asr_parameters.get("suspect_thresholds"),
+            "suspect_thresholds": suspect_thresholds,
         },
         "audio_info": {
             "language_detected": detected_language,
@@ -523,6 +542,27 @@ def _diarize_payload(
     )
 
 
+def _complete_without_diarization(payload: dict[str, Any], config: RunConfig) -> dict[str, Any]:
+    """The complete payload of a resumed snapshot when this run doesn't diarize.
+
+    The ASR parameters and timings come from the snapshot, ``diarization``
+    from this run (off). The segments go through :func:`_normalize_segment`,
+    as on the diarization path, so stale ``suspect`` flags are dropped
+    and recomputed.
+    """
+    return _build_payload(
+        stage=STAGE_COMPLETE,
+        source_file=config.input_file.resolve(),
+        transcribed_at=datetime.now(),
+        config=config,
+        asr_parameters=_snapshot_asr_parameters(payload),
+        detected_language=payload["audio_info"].get("language_detected") or "und",
+        language_probability=payload["audio_info"].get("language_probability"),
+        segments=[_normalize_segment(s) for s in payload.get("segments", [])],
+        processing_seconds=float(payload.get("stats", {}).get("processing_seconds") or 0.0),
+    )
+
+
 def _resolve_speaker_identities(
     speaker_clusters: dict[str, Any], config: RunConfig
 ) -> dict[str, Any]:
@@ -675,6 +715,10 @@ def run_pipeline(config: RunConfig) -> dict[str, Path]:
                     paths["aligned"],
                 )
             raise
+    elif config.resume_from_aligned:
+        # A snapshot without diarization: rebuild, so the result describes this
+        # run (diarization off, current schema), not the snapshot's.
+        final_payload = _complete_without_diarization(aligned_payload, config)
     else:
         # No diarization: promote the aligned payload to "complete" stage as-is.
         final_payload = dict(aligned_payload)

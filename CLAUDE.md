@@ -117,7 +117,7 @@ Both share the same schema. The top-level `stage` field discriminates them (`"al
 
 `--resume-from-aligned PATH` skips ASR + alignment and feeds the snapshot straight to diarization. The aligned snapshot is the legitimate input form for resuming. `pipeline._load_aligned_payload` refuses a `*_transcript.json` that already carries speakers (segments, `speaker_clusters` or `speaker_identities`), because re-diarizing would clobber them. The one exception is a finished transcript with no speakers: a `--no-diarize` run writes no aligned snapshot, so its JSON is the only way to add diarization later.
 
-On a resume, **everything under `parameters` except `diarization` is carried from the snapshot** (`pipeline._snapshot_asr_parameters`). Those fields describe the ASR that produced the segments, which did not run again: the current run's `--model`, `--language`, prompt or beam flags must not relabel them. Only `diarization` describes the current run. `_build_payload` takes the ASR block ready-made (`_asr_parameters` on a fresh run), so both stages still go through one builder.
+On a resume, **everything under `parameters` except `diarization` is carried from the snapshot** (`pipeline._snapshot_asr_parameters`). Those fields describe the ASR that produced the segments, which did not run again: the current run's `--model`, `--language`, prompt or beam flags must not relabel them. Only `diarization` describes the current run. `_build_payload` takes the ASR block ready-made (`_asr_parameters` on a fresh run), so both stages still go through one builder. A resume with `--no-diarize` is rebuilt the same way (`_complete_without_diarization`), not copied: the result says diarization was off and has the current schema.
 
 ### 6. Pre-flight runs by default
 
@@ -149,7 +149,7 @@ The whole identification path (`speaker_db.auto_resolve_speaker_map`, `_refresh_
 
 ### 9. Suspect thresholds are policy, not data
 
-`stats.DEFAULT_AVG_LOGPROB_THRESHOLD = -1.0` and `DEFAULT_NO_SPEECH_PROB_THRESHOLD = 0.6` are tuning constants for whisperX large-v3. They are persisted in `parameters.suspect_thresholds` so a downstream consumer can tell *which* thresholds produced the flags. Don't change the defaults silently — bump `schema_version` if the new defaults would meaningfully reshuffle the suspect set on existing JSONs.
+`stats.DEFAULT_AVG_LOGPROB_THRESHOLD = -1.0` and `DEFAULT_NO_SPEECH_PROB_THRESHOLD = 0.6` are tuning constants for whisperX large-v3. They are persisted in `parameters.suspect_thresholds` so a downstream consumer can tell *which* thresholds produced the flags. Don't change the defaults silently — bump `schema_version` if the new defaults would meaningfully reshuffle the suspect set on existing JSONs. The record is always the thresholds this run applied (`pipeline._applied_suspect_thresholds`), a resume included: the flags are recomputed, so a snapshot's copy is not carried. `null` means an ASR without confidences these thresholds can read: then nothing is flagged.
 
 `mark_suspect_segments` mutates segments in place. Calling it on segments that were already flagged is idempotent (the existing `suspect: true` is overwritten with the same value); but if you change thresholds between calls, the previous flags are NOT cleared first. If that ever matters, normalize at the start of the function.
 

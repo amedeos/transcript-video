@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from transcript_video import pipeline as pipeline_mod
+from transcript_video import stats as stats_mod
 from transcript_video.config import (
     DiarizationConfig,
     FrontmatterConfig,
@@ -186,6 +187,66 @@ class TestRunPipelineHappyPath:
         assert params["beam_size"] == 10
         # diarization describes the run that diarized
         assert params["diarization"]["num_speakers"] == 3
+
+    def test_resume_without_diarization_describes_this_run(self, stub_pipeline, fake_input, tmp_path):
+        """A snapshot (written because diarization was on) resumed with --no-diarize."""
+        config = _config(fake_input, write_md=False)
+        config.model = "large-v3"
+        pipeline_mod.run_pipeline(config)
+        snap_path = tmp_path / "video_transcript.aligned.json"
+        snap = json.loads(snap_path.read_text(encoding="utf-8"))
+        assert snap["parameters"]["diarization"]["enabled"] is True
+        snap["schema_version"] = 2
+        snap["segments"][0]["suspect"] = True  # a stale flag
+        snap["segments"][0]["suspect_reasons"] = ["old threshold"]
+        snap_path.write_text(json.dumps(snap), encoding="utf-8")
+
+        resume = _config(fake_input, write_md=False)
+        resume.model = "small"
+        resume.diarization = DiarizationConfig(enabled=False)
+        resume.resume_from_aligned = snap_path
+        final = json.loads(pipeline_mod.run_pipeline(resume)["json"].read_text(encoding="utf-8"))
+
+        assert final["stage"] == "complete"
+        assert final["schema_version"] == pipeline_mod.SCHEMA_VERSION
+        assert final["parameters"]["diarization"]["enabled"] is False
+        assert final["parameters"]["model"] == "large-v3"  # from the snapshot
+        assert "suspect" not in final["segments"][0]
+        assert final["stats"]["num_suspect"] == 0
+
+    def test_resume_records_the_thresholds_it_applies(self, stub_pipeline, fake_input, tmp_path):
+        pipeline_mod.run_pipeline(_config(fake_input, write_md=False))
+        snap_path = tmp_path / "video_transcript.aligned.json"
+        snap = json.loads(snap_path.read_text(encoding="utf-8"))
+        snap["parameters"]["suspect_thresholds"] = {"avg_logprob": -5.0, "no_speech_prob": 0.99}
+        snap_path.write_text(json.dumps(snap), encoding="utf-8")
+
+        resume = _config(fake_input, write_md=False)
+        resume.resume_from_aligned = snap_path
+        final = json.loads(pipeline_mod.run_pipeline(resume)["json"].read_text(encoding="utf-8"))
+        assert final["parameters"]["suspect_thresholds"] == {
+            "avg_logprob": stats_mod.DEFAULT_AVG_LOGPROB_THRESHOLD,
+            "no_speech_prob": stats_mod.DEFAULT_NO_SPEECH_PROB_THRESHOLD,
+        }
+
+    def test_null_suspect_thresholds_stay_null(self, fake_input):
+        cfg = _config(fake_input)
+        params = pipeline_mod._asr_parameters(cfg, device="cpu", compute_type="float32", batch_size=4)
+        params["suspect_thresholds"] = None  # an ASR without whisperX-style confidences
+        payload = pipeline_mod._build_payload(
+            stage=pipeline_mod.STAGE_COMPLETE,
+            source_file=fake_input,
+            transcribed_at=__import__("datetime").datetime(2026, 11, 4, 10, 0, 0),
+            config=cfg,
+            asr_parameters=params,
+            detected_language="und",
+            language_probability=None,
+            segments=[{"start": 0.0, "end": 1.0, "text": "x", "avg_logprob": -9.0}],
+            processing_seconds=1.0,
+        )
+        assert payload["parameters"]["suspect_thresholds"] is None
+        assert "suspect" not in payload["segments"][0]  # no thresholds, no flags
+        assert payload["stats"]["num_suspect"] == 0
 
     def test_resume_from_v2_snapshot_has_unknown_batch_size(
         self, stub_pipeline, fake_input, tmp_path
