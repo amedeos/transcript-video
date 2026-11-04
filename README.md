@@ -108,6 +108,10 @@ transcript-from-video video.mp4 --md \
 transcript-from-video lecture.mp4 --no-diarize --txt --srt
 ```
 
+#### Diarization speed
+
+pyannote computes a speaker embedding for every 10 s window and each of its (up to three) local speakers, running the same audio through the network three times. transcript-video runs the network once per window and reuses it for the three speakers. The speaker turns stay the same, and on CPU diarization gets several times faster: a laptop benchmark went from 237 s to 65 s for 2 minutes of audio. A self-check runs before each diarization. If it fails, or a pyannote version doesn't allow the shortcut, stock pyannote runs and a log line says so.
+
 #### Argument groups
 
 **Model / device**
