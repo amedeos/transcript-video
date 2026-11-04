@@ -45,22 +45,44 @@ def check_ffmpeg() -> CheckResult:
     )
 
 
-def check_cuda(device_request: str | None) -> CheckResult:
-    """Verify CUDA is usable when the user requested it (or wants auto-detect)."""
-    requested = (device_request or "auto").lower()
-    if requested == "cpu":
+def check_cuda(
+    device_request: str | None, *, run_asr: bool = True, run_torch: bool = True
+) -> CheckResult:
+    """Verify the requested device can be honored for the stages that will run.
+
+    Uses :func:`asr.plan_devices`, the same rules the pipeline applies, so the
+    pre-flight verdict and the actual run can't disagree. An explicit ``cuda``
+    fails unless every library that will run can use it. ``auto`` never fails:
+    whichever library lacks CUDA runs on CPU. ``run_asr=False`` (resume) skips
+    the ctranslate2 requirement; with ``run_torch=False`` too, nothing needs a
+    device.
+    """
+    if (device_request or "auto").lower() == "cpu":
         return CheckResult("cuda", True, "skipped (--device cpu)")
 
-    cuda_ok, hint = asr_mod.check_cuda_available()
-    if cuda_ok:
-        return CheckResult("cuda", True, f"available (compute_type hint: {hint})")
+    plan = asr_mod.plan_devices(device_request, run_asr=run_asr, run_torch=run_torch)
+    if plan.error:
+        return CheckResult("cuda", False, plan.error)
 
-    if requested == "cuda":
-        return CheckResult(
-            "cuda", False, "--device cuda requested but no CUDA device is available"
-        )
-    # auto: not blocking, will silently fall back to CPU.
-    return CheckResult("cuda", True, "not available; pipeline will fall back to CPU (slower)")
+    used = {d for d in (plan.asr, plan.torch, plan.vad) if d}
+    if not used:
+        return CheckResult("cuda", True, "skipped (no stage needs a device)")
+    if used == {"cuda"}:
+        hint = asr_mod.check_cuda_available()[1] if plan.asr else None
+        detail = f"compute_type hint: {hint}" if hint else "torch"
+        return CheckResult("cuda", True, f"available ({detail})")
+    if used == {"cpu"}:
+        message = "not available; pipeline will fall back to CPU (slower)"
+        return CheckResult("cuda", True, " ".join((message, *plan.notes)))
+
+    stages = []
+    if plan.asr:
+        stages.append(f"ASR on {plan.asr}")
+    if plan.vad and plan.vad != plan.asr:
+        stages.append(f"VAD on {plan.vad}")
+    if plan.torch:
+        stages.append(f"alignment/diarization on {plan.torch}")
+    return CheckResult("cuda", True, f"partial: {', '.join(stages)}. {' '.join(plan.notes)}".strip())
 
 
 def _resolve_pipeline_class():
@@ -273,7 +295,9 @@ def run_preflight(config: RunConfig, *, network: bool = True) -> list[CheckResul
     """
     results: list[CheckResult] = []
     results.append(check_ffmpeg())
-    results.append(check_cuda(config.device))
+    results.append(
+        check_cuda(config.device, run_asr=config.runs_asr, run_torch=config.runs_torch)
+    )
     results.append(check_whisperx_api())
 
     if not config.diarization.enabled:

@@ -66,6 +66,31 @@ def test_returns_empty_for_no_speaker_labels(tmp_path):
     assert result == {}
 
 
+def test_predecoded_audio_skips_decoding(tmp_path, monkeypatch):
+    """With ``audio=`` the file is never decoded (the path doesn't even exist)."""
+    import numpy as np
+    import whisperx
+
+    from transcript_video.speaker_embed import extract_cluster_embeddings
+
+    token = _hf_token()
+    if not token:
+        pytest.skip("no HF_TOKEN in env; cannot download embedding model")
+
+    def _no_decode(_path):
+        raise AssertionError("audio was decoded again")
+
+    monkeypatch.setattr(whisperx, "load_audio", _no_decode)
+    rng = np.random.default_rng(42)
+    audio = rng.uniform(-0.5, 0.5, SAMPLE_RATE * 5).astype(np.float32)
+    segments = [{"start": 0.0, "end": 4.0, "speaker": "SPEAKER_00"}]
+
+    result = extract_cluster_embeddings(
+        tmp_path / "missing.wav", segments, hf_token=token, audio=audio
+    )
+    assert set(result) == {"SPEAKER_00"}
+
+
 def test_smoke_two_clusters(tmp_path):
     from transcript_video.speaker_embed import (
         DEFAULT_EMBEDDING_MODEL,

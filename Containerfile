@@ -26,13 +26,14 @@
 #         transcript-video \
 #         meeting.mp4 --md --tag openshift
 #
-# Run (CPU only, --device cpu):
+# Run (CPU only): no GPU passthrough; the default --device auto falls back
+# to CPU by itself, and a --cpus quota sets the default thread count.
 #     podman run --rm \
 #         -e HF_TOKEN="$HF_TOKEN" \
 #         -v "$(pwd):/data:Z" \
 #         -v "$HOME/.cache/huggingface:/root/.cache/huggingface:Z" \
 #         transcript-video \
-#         meeting.mp4 --device cpu --md
+#         meeting.mp4 --md
 #
 # The default working directory inside the container is /data, so paths
 # in the command line are relative to the host directory mounted there.

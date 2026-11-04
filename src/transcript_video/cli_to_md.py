@@ -107,7 +107,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Auto-match the JSON's cached cluster embeddings against the voice DB "
             "and inject the names into speaker_identities at re-render time. "
-            "Requires a schema v2 JSON (cluster embeddings present); no audio, no GPU."
+            "Requires a schema v2+ JSON (cluster embeddings present); no audio, no GPU."
         ),
     )
     identify_group.add_argument(
@@ -182,20 +182,6 @@ def _build_pre_parser() -> argparse.ArgumentParser:
     pre.add_argument("--profile", default=None)
     pre.add_argument("json_path", nargs="?", default=None)
     return pre
-
-
-def _apply_config_defaults(parser: argparse.ArgumentParser, cli_defaults: dict) -> tuple[set[str], set[str]]:
-    known = {a.dest for a in parser._actions if a.dest != "help"}
-    applied: dict = {}
-    ignored: set[str] = set()
-    for key, value in cli_defaults.items():
-        if key in known:
-            applied[key] = value
-        else:
-            ignored.add(key)
-    if applied:
-        parser.set_defaults(**applied)
-    return set(applied.keys()), ignored
 
 
 def _resolve_speaker_stats(transcript: dict) -> dict:
@@ -330,10 +316,7 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     parser = _build_parser()
-    if cli_defaults:
-        _apply_config_defaults(parser, cli_defaults)
-
-    args = parser.parse_args(argv)
+    args, _, _ = project_config.parse_args_with_config(parser, argv, cli_defaults)
 
     setup_logging(quiet=args.quiet, verbose=args.verbose)
     silence_known_noisy_warnings()

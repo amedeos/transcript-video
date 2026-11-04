@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from . import project_config
+from .asr import COMPUTE_TYPES, CPU_DEFAULT_BATCH_SIZE, GPU_DEFAULT_BATCH_SIZE
 from .config import (
     DiarizationConfig,
     FrontmatterConfig,
@@ -69,7 +70,36 @@ Examples:
     model_group.add_argument(
         "--compute-type",
         default=None,
-        help="Override compute type (e.g. float16, int8, int8_float16). Default: auto.",
+        type=str.lower,
+        choices=COMPUTE_TYPES,
+        metavar="TYPE",
+        help=(
+            f"Override compute type, one of: {', '.join(COMPUTE_TYPES)} (any case). "
+            "Unset, 'auto' or 'default': float16 on CUDA, float32 on CPU (lossless)."
+        ),
+    )
+    model_group.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "CPU threads for ASR, alignment and diarization. Default or 0: logical CPUs - 1 "
+            "(capped by a container CPU quota) for stages on CPU; stages on the GPU keep "
+            "their libraries' defaults. An explicit N applies to every stage; without it, "
+            "OMP_NUM_THREADS (or MKL_NUM_THREADS) counts as an explicit N."
+        ),
+    )
+    model_group.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "ASR chunks decoded at once. Changes speed and memory, not accuracy. "
+            f"Default (or 0): {GPU_DEFAULT_BATCH_SIZE} on CUDA, {CPU_DEFAULT_BATCH_SIZE} on CPU. "
+            "Lower it if the run is killed for lack of memory."
+        ),
     )
 
     parser.add_argument(
@@ -116,9 +146,9 @@ Examples:
         "--resume-from-aligned",
         default=None,
         help=(
-            "Path to a previously-written *_transcript.aligned.json. Skips ASR + alignment "
-            "and jumps straight to diarization. The source video is taken from the snapshot "
-            "(or override by passing input_file)."
+            "Path to a previously-written *_transcript.aligned.json (or the *_transcript.json "
+            "of a --no-diarize run). Skips ASR + alignment and jumps straight to diarization. "
+            "The source video is taken from the snapshot (or override by passing input_file)."
         ),
     )
 
@@ -277,27 +307,6 @@ def _build_pre_parser() -> argparse.ArgumentParser:
     return pre
 
 
-def _apply_config_defaults(
-    parser: argparse.ArgumentParser, cli_defaults: dict
-) -> tuple[set[str], set[str]]:
-    """Filter the config's flat dict to keys recognized by the main parser.
-
-    Returns ``(applied, ignored)`` for diagnostics. Also calls
-    ``parser.set_defaults`` for the applied keys.
-    """
-    known = {a.dest for a in parser._actions if a.dest != "help"}
-    applied: dict = {}
-    ignored: set[str] = set()
-    for key, value in cli_defaults.items():
-        if key in known:
-            applied[key] = value
-        else:
-            ignored.add(key)
-    if applied:
-        parser.set_defaults(**applied)
-    return set(applied.keys()), ignored
-
-
 def _resolve_prompt(args: argparse.Namespace) -> str | None:
     if args.no_prompt:
         return ""
@@ -330,12 +339,16 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     parser = _build_parser()
-    applied: set[str] = set()
-    ignored: set[str] = set()
-    if cli_defaults:
-        applied, ignored = _apply_config_defaults(parser, cli_defaults)
+    args, applied, ignored = project_config.parse_args_with_config(parser, argv, cli_defaults)
 
-    args = parser.parse_args(argv)
+    # Types and choices of config values were checked by parse_args_with_config.
+    # 0 means "auto", so `--threads 0` on the CLI can undo a config value.
+    for flag, dest in (("--threads", "threads"), ("--batch-size", "batch_size")):
+        value = getattr(args, dest)
+        if value is not None and value < 0:
+            parser.error(f"{flag} / config '{dest}' must be >= 0, 0 = auto (got {value!r})")
+        if value == 0:
+            setattr(args, dest, None)
 
     setup_logging(quiet=args.quiet, verbose=args.verbose)
     silence_known_noisy_warnings()
@@ -382,6 +395,8 @@ def main(argv: list[str] | None = None) -> None:
         beam_size=args.beam_size,
         device=None if args.device == "auto" else args.device,
         compute_type=args.compute_type,
+        threads=args.threads,
+        batch_size=args.batch_size,
         language=args.language,
         initial_prompt=_resolve_prompt(args),
         hotwords=_resolve_hotwords(args),

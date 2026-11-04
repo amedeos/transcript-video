@@ -150,6 +150,13 @@ class TestSchemaValidation:
         with pytest.raises(EnrollmentError, match="schema_version"):
             learn_from_transcript(json_path, {"SPEAKER_00": "Mario"}, tmp_path / "voices.json")
 
+    def test_schema_v3_accepted(self, tmp_path):
+        # v3 only added parameters.batch_size; enrollment reads speaker_clusters.
+        json_path = tmp_path / "t.json"
+        _make_transcript_json(json_path, schema_version=3, clusters=_default_clusters())
+        result = learn_from_transcript(json_path, {"SPEAKER_00": "Mario"}, tmp_path / "voices.json")
+        assert result["added"] == {"SPEAKER_00": "Mario"}
+
     def test_missing_schema_version_rejected(self, tmp_path):
         json_path = tmp_path / "t.json"
         json_path.write_text(json.dumps({"speaker_clusters": _default_clusters()}))

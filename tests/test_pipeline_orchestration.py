@@ -46,7 +46,14 @@ def stub_pipeline(monkeypatch, fake_audio):
     """Stub all torch/whisperX boundaries used by run_pipeline."""
 
     class FakeModel:
-        def transcribe(self, audio, batch_size, **kwargs):
+        # Same signature as whisperX 3.8's FasterWhisperPipeline.transcribe:
+        # decoding options (prompt, hotwords, anti-loop) are NOT accepted here,
+        # so passing one fails the test as it fails the real run.
+        def transcribe(
+            self, audio, batch_size=None, num_workers=0, language=None, task=None,
+            chunk_size=30, print_progress=False, combined_progress=False,
+            verbose=False, progress_callback=None,
+        ):
             return {
                 "language": "it",
                 "language_probability": 0.95,
@@ -56,7 +63,9 @@ def stub_pipeline(monkeypatch, fake_audio):
                 ],
             }
 
-    monkeypatch.setattr(pipeline_mod.asr_mod, "resolve_device_and_compute", lambda d, c: ("cuda", "float16"))
+    monkeypatch.setattr(pipeline_mod.asr_mod, "check_cuda_available", lambda: (True, "float16"))
+    monkeypatch.setattr(pipeline_mod.asr_mod, "torch_cuda_available", lambda: True)
+    monkeypatch.setattr(pipeline_mod.asr_mod, "apply_torch_threads", lambda n: None)
     monkeypatch.setattr(pipeline_mod.asr_mod, "load_whisperx_model", lambda *a, **kw: FakeModel())
     monkeypatch.setattr(pipeline_mod.asr_mod, "load_audio", lambda _path: fake_audio)
     monkeypatch.setattr(
@@ -130,11 +139,38 @@ class TestRunPipelineHappyPath:
         md = written["md"].read_text(encoding="utf-8")
         assert "## [00:00:00] SPEAKER_00" in md
 
-    def test_schema_version_is_two(self, stub_pipeline, fake_input):
+    def test_schema_version_is_three_with_batch_size(self, stub_pipeline, fake_input):
         config = _config(fake_input, write_md=False)
         written = pipeline_mod.run_pipeline(config)
         final = json.loads(written["json"].read_text(encoding="utf-8"))
-        assert final["schema_version"] == 2
+        assert final["schema_version"] == 3
+        assert final["parameters"]["batch_size"] == 16  # stub_pipeline runs on cuda
+
+    def test_resume_keeps_the_snapshot_batch_size(self, stub_pipeline, fake_input, tmp_path):
+        config = _config(fake_input, write_md=False)
+        config.batch_size = 2
+        pipeline_mod.run_pipeline(config)
+
+        resume = _config(fake_input, write_md=False)
+        resume.resume_from_aligned = tmp_path / "video_transcript.aligned.json"
+        final = json.loads(pipeline_mod.run_pipeline(resume)["json"].read_text(encoding="utf-8"))
+        assert final["parameters"]["batch_size"] == 2
+
+    def test_resume_from_v2_snapshot_has_unknown_batch_size(
+        self, stub_pipeline, fake_input, tmp_path
+    ):
+        pipeline_mod.run_pipeline(_config(fake_input, write_md=False))
+        snap_path = tmp_path / "video_transcript.aligned.json"
+        snap = json.loads(snap_path.read_text(encoding="utf-8"))
+        snap["schema_version"] = 2
+        del snap["parameters"]["batch_size"]
+        snap_path.write_text(json.dumps(snap), encoding="utf-8")
+
+        resume = _config(fake_input, write_md=False)
+        resume.resume_from_aligned = snap_path
+        final = json.loads(pipeline_mod.run_pipeline(resume)["json"].read_text(encoding="utf-8"))
+        assert final["schema_version"] == 3
+        assert final["parameters"]["batch_size"] is None
 
     def test_speaker_clusters_cached_in_complete_payload(self, stub_pipeline, fake_input):
         config = _config(fake_input, write_md=False)
@@ -156,7 +192,7 @@ class TestRunPipelineHappyPath:
             (tmp_path / "video_transcript.aligned.json").read_text(encoding="utf-8")
         )
         # Aligned stage runs before diarization → no clusters.
-        assert aligned["schema_version"] == 2
+        assert aligned["schema_version"] == 3
         assert aligned["speaker_clusters"] == {}
 
     def test_no_diarize_skips_aligned_snapshot(self, stub_pipeline, fake_input, tmp_path):
@@ -348,6 +384,472 @@ class TestResumeFromAligned:
         final = json.loads(written["json"].read_text(encoding="utf-8"))
         assert final["stage"] == "complete"
         assert any("speaker" in s for s in final["segments"])
+
+    def test_resume_refuses_a_finished_transcript_with_speakers(
+        self, stub_pipeline, fake_input, tmp_path, monkeypatch, capsys
+    ):
+        """Invariant #5: re-diarizing a finished JSON would clobber its speakers."""
+        written = pipeline_mod.run_pipeline(_config(fake_input))
+
+        def _never(*a, **kw):
+            raise AssertionError("diarization must not start")
+
+        monkeypatch.setattr(pipeline_mod.diarize_mod, "diarize_and_assign", _never)
+        config = _config(fake_input)
+        config.resume_from_aligned = written["json"]
+        with pytest.raises(SystemExit):
+            pipeline_mod.run_pipeline(config)
+        assert "speakers already assigned" in capsys.readouterr().err
+
+    def test_resume_accepts_a_no_diarize_transcript(self, stub_pipeline, fake_input, tmp_path):
+        """A --no-diarize run writes no aligned snapshot: its JSON is the way to diarize later."""
+        first = _config(fake_input)
+        first.diarization = DiarizationConfig(enabled=False)
+        written = pipeline_mod.run_pipeline(first)
+        assert not (tmp_path / "video_transcript.aligned.json").exists()
+
+        config = _config(fake_input)
+        config.resume_from_aligned = written["json"]
+        final = json.loads(pipeline_mod.run_pipeline(config)["json"].read_text(encoding="utf-8"))
+        assert any("speaker" in seg for seg in final["segments"])
+
+    def test_resume_gpu_snapshot_on_cpu_only_machine(
+        self, stub_pipeline, fake_input, tmp_path, monkeypatch
+    ):
+        """A snapshot made on a GPU box diarizes on CPU when no GPU is present now."""
+        pipeline_mod.run_pipeline(_config(fake_input))
+        aligned_path = tmp_path / "video_transcript.aligned.json"
+        assert json.loads(aligned_path.read_text(encoding="utf-8"))["parameters"]["device"] == "cuda"
+
+        # Now on a machine without CUDA.
+        monkeypatch.setattr(pipeline_mod.asr_mod, "check_cuda_available", lambda: (False, None))
+        monkeypatch.setattr(pipeline_mod.asr_mod, "torch_cuda_available", lambda: False)
+        seen: dict[str, str] = {}
+
+        def _fake_diarize(aligned, audio, **kwargs):
+            seen["diarize"] = kwargs["device"]
+            return {
+                "segments": [{**s, "speaker": "SPEAKER_00"} for s in aligned["segments"]],
+                "word_segments": [],
+            }
+
+        def _fake_extract(audio_path, segments, **kwargs):
+            seen["embed"] = kwargs["device"]
+            return {}
+
+        monkeypatch.setattr(pipeline_mod.diarize_mod, "diarize_and_assign", _fake_diarize)
+        monkeypatch.setattr(
+            pipeline_mod.speaker_embed_mod, "extract_cluster_embeddings", _fake_extract
+        )
+
+        resume_config = _config(fake_input)
+        resume_config.resume_from_aligned = aligned_path
+        written = pipeline_mod.run_pipeline(resume_config)
+
+        assert seen == {"diarize": "cpu", "embed": "cpu"}
+        # The JSON still records the device/compute type the ASR actually ran with.
+        params = json.loads(written["json"].read_text(encoding="utf-8"))["parameters"]
+        assert params["device"] == "cuda"
+        assert params["compute_type"] == "float16"
+
+    def test_resume_with_explicit_cuda_on_cpu_only_machine_stops(
+        self, stub_pipeline, fake_input, tmp_path, monkeypatch
+    ):
+        pipeline_mod.run_pipeline(_config(fake_input))
+        aligned_path = tmp_path / "video_transcript.aligned.json"
+        monkeypatch.setattr(pipeline_mod.asr_mod, "check_cuda_available", lambda: (False, None))
+        monkeypatch.setattr(pipeline_mod.asr_mod, "torch_cuda_available", lambda: False)
+
+        def _never(*a, **kw):
+            raise AssertionError("diarization must not start")
+
+        monkeypatch.setattr(pipeline_mod.diarize_mod, "diarize_and_assign", _never)
+        resume_config = _config(fake_input)
+        resume_config.resume_from_aligned = aligned_path
+        resume_config.device = "cuda"
+        with pytest.raises(SystemExit):
+            pipeline_mod.run_pipeline(resume_config)
+
+    def test_resume_honors_explicit_cpu(self, stub_pipeline, fake_input, tmp_path, monkeypatch):
+        pipeline_mod.run_pipeline(_config(fake_input))
+        aligned_path = tmp_path / "video_transcript.aligned.json"
+        seen: dict[str, str] = {}
+
+        def _fake_diarize(aligned, audio, **kwargs):
+            seen["diarize"] = kwargs["device"]
+            return {"segments": aligned["segments"], "word_segments": []}
+
+        monkeypatch.setattr(pipeline_mod.diarize_mod, "diarize_and_assign", _fake_diarize)
+
+        resume_config = _config(fake_input)
+        resume_config.resume_from_aligned = aligned_path
+        resume_config.device = "cpu"
+        pipeline_mod.run_pipeline(resume_config)
+
+        assert seen["diarize"] == "cpu"
+
+
+class TestDevices:
+    def _capture_stage_devices(self, monkeypatch):
+        seen: dict[str, str] = {}
+
+        def _fake_align(segs, lang, audio, device):
+            seen["align"] = device
+            return {"segments": segs, "word_segments": []}
+
+        def _fake_diarize(aligned, audio, **kwargs):
+            seen["diarize"] = kwargs["device"]
+            return {"segments": aligned["segments"], "word_segments": []}
+
+        def _fake_extract(audio_path, segments, **kwargs):
+            seen["embed"] = kwargs["device"]
+            return {}
+
+        monkeypatch.setattr(pipeline_mod.asr_mod, "align_segments", _fake_align)
+        monkeypatch.setattr(pipeline_mod.diarize_mod, "diarize_and_assign", _fake_diarize)
+        monkeypatch.setattr(
+            pipeline_mod.speaker_embed_mod, "extract_cluster_embeddings", _fake_extract
+        )
+        return seen
+
+    def test_devices_resolved_once_per_run(self, stub_pipeline, fake_input, monkeypatch):
+        """All torch stages get the same device, probed once up front.
+
+        Regression: on a CPU-only host ctranslate2's CUDA probe flipped
+        between calls, which sent ASR to cpu and pyannote to cuda in one run.
+        """
+        calls = {"n": 0}
+        real_plan = pipeline_mod.asr_mod.plan_devices
+
+        def _counting(*a, **kw):
+            calls["n"] += 1
+            return real_plan(*a, **kw)
+
+        monkeypatch.setattr(pipeline_mod.asr_mod, "plan_devices", _counting)
+        seen = self._capture_stage_devices(monkeypatch)
+
+        pipeline_mod.run_pipeline(_config(fake_input, write_md=False))
+
+        assert calls["n"] == 1
+        assert seen == {"align": "cuda", "diarize": "cuda", "embed": "cuda"}
+
+    def test_cpu_only_torch_runs_torch_stages_on_cpu(self, stub_pipeline, fake_input, monkeypatch):
+        """GPU visible to ctranslate2, CPU-only torch wheel, --device auto.
+
+        whisperX's VAD is a torch model: it must be built on CPU too, while
+        the ASR keeps the GPU. Regression: whisperX put it on cuda:0 and the
+        run crashed at model load.
+        """
+        monkeypatch.setattr(pipeline_mod.asr_mod, "torch_cuda_available", lambda: False)
+        monkeypatch.setattr(pipeline_mod.asr_mod, "cpu_vad_supported", lambda: True)
+        seen = self._capture_stage_devices(monkeypatch)
+        real_load = pipeline_mod.asr_mod.load_whisperx_model
+
+        def _load(name, device, *a, **kw):
+            seen["asr"], seen["vad"] = device, kw.get("vad_device")
+            return real_load(name, device, *a, **kw)
+
+        monkeypatch.setattr(pipeline_mod.asr_mod, "load_whisperx_model", _load)
+
+        written = pipeline_mod.run_pipeline(_config(fake_input, write_md=False))
+
+        assert seen == {"asr": "cuda", "vad": "cpu", "align": "cpu", "diarize": "cpu", "embed": "cpu"}
+        params = json.loads(written["json"].read_text(encoding="utf-8"))["parameters"]
+        assert params["device"] == "cuda"  # the ASR's device
+
+    def test_resume_without_diarization_ignores_explicit_cuda(
+        self, stub_pipeline, fake_input, tmp_path, monkeypatch
+    ):
+        """Nothing runs on a device, so a shared `device = "cuda"` config mustn't block it."""
+        pipeline_mod.run_pipeline(_config(fake_input))
+        aligned_path = tmp_path / "video_transcript.aligned.json"
+        monkeypatch.setattr(pipeline_mod.asr_mod, "check_cuda_available", lambda: (False, None))
+        monkeypatch.setattr(pipeline_mod.asr_mod, "torch_cuda_available", lambda: False)
+
+        config = _config(fake_input)
+        config.resume_from_aligned = aligned_path
+        config.diarization = DiarizationConfig(enabled=False)
+        config.device = "cuda"
+        written = pipeline_mod.run_pipeline(config)
+
+        assert json.loads(written["json"].read_text(encoding="utf-8"))["stage"] == "complete"
+
+    def test_explicit_cuda_without_torch_cuda_stops_before_asr(
+        self, stub_pipeline, fake_input, monkeypatch
+    ):
+        monkeypatch.setattr(pipeline_mod.asr_mod, "torch_cuda_available", lambda: False)
+
+        def _never(*a, **kw):
+            raise AssertionError("the model must not be loaded")
+
+        monkeypatch.setattr(pipeline_mod.asr_mod, "load_whisperx_model", _never)
+        config = _config(fake_input)
+        config.device = "cuda"
+        with pytest.raises(SystemExit):
+            pipeline_mod.run_pipeline(config)
+
+
+class TestThreads:
+    def test_explicit_threads_reach_asr_and_torch(self, stub_pipeline, fake_input, monkeypatch):
+        seen: dict[str, int] = {}
+
+        class FakeModel:
+            def transcribe(self, audio, batch_size, **kwargs):
+                return {"language": "it", "segments": [{"start": 0.0, "end": 1.0, "text": "x"}]}
+
+        def _fake_load(*a, **kw):
+            seen["asr"] = kw["threads"]
+            return FakeModel()
+
+        monkeypatch.setattr(pipeline_mod.asr_mod, "load_whisperx_model", _fake_load)
+        monkeypatch.setattr(
+            pipeline_mod.asr_mod, "apply_torch_threads", lambda n: seen.__setitem__("torch", n)
+        )
+
+        config = _config(fake_input, write_md=False)
+        config.threads = 3
+        pipeline_mod.run_pipeline(config)
+
+        assert seen == {"asr": 3, "torch": 3}
+
+    def test_cpu_run_default_threads_are_cpus_minus_one(
+        self, stub_pipeline, fake_input, monkeypatch
+    ):
+        seen: dict[str, int | None] = {}
+        monkeypatch.setattr(pipeline_mod.asr_mod, "available_cpu_count", lambda: 8)
+        monkeypatch.setattr(pipeline_mod.asr_mod, "check_cuda_available", lambda: (False, None))
+        monkeypatch.setattr(pipeline_mod.asr_mod, "torch_cuda_available", lambda: False)
+        monkeypatch.setattr(
+            pipeline_mod.asr_mod, "apply_torch_threads", lambda n: seen.__setitem__("torch", n)
+        )
+        real_fake_model = pipeline_mod.asr_mod.load_whisperx_model
+
+        def _fake_load(*a, **kw):
+            seen["asr"] = kw["threads"]
+            return real_fake_model(*a, **kw)
+
+        monkeypatch.setattr(pipeline_mod.asr_mod, "load_whisperx_model", _fake_load)
+
+        pipeline_mod.run_pipeline(_config(fake_input, write_md=False))
+
+        assert seen == {"torch": 7, "asr": 7}
+
+    def test_gpu_run_keeps_library_defaults(self, stub_pipeline, fake_input, monkeypatch):
+        """On GPU the CPUs-1 policy isn't applied; torch keeps its own default."""
+        seen: dict[str, int | None] = {}
+        monkeypatch.setattr(
+            pipeline_mod.asr_mod, "apply_torch_threads", lambda n: seen.__setitem__("torch", n)
+        )
+        real_fake_model = pipeline_mod.asr_mod.load_whisperx_model
+
+        def _fake_load(*a, **kw):
+            seen["asr"] = kw["threads"]
+            return real_fake_model(*a, **kw)
+
+        monkeypatch.setattr(pipeline_mod.asr_mod, "load_whisperx_model", _fake_load)
+
+        pipeline_mod.run_pipeline(_config(fake_input, write_md=False))
+
+        assert seen == {"asr": None}
+
+
+class TestDecodingOptions:
+    """Prompt, hotwords and anti-loop go in at model load, never to transcribe()."""
+
+    def test_options_go_to_load_model(self, stub_pipeline, fake_input, monkeypatch):
+        seen: dict = {}
+        real_load = pipeline_mod.asr_mod.load_whisperx_model
+
+        def _load(name, device, compute_type, asr_options, **kw):
+            seen.update(asr_options)
+            return real_load(name, device, compute_type, asr_options, **kw)
+
+        monkeypatch.setattr(pipeline_mod.asr_mod, "load_whisperx_model", _load)
+        config = _config(fake_input, write_md=False)
+        config.initial_prompt = "Riunione di lavoro."
+        config.hotwords = "OpenShift"
+        config.anti_loop = True
+        config.beam_size = 10
+        pipeline_mod.run_pipeline(config)  # the strict FakeModel.transcribe must not raise
+
+        assert seen == {
+            "beam_size": 10,
+            "initial_prompt": "Riunione di lavoro.",
+            "hotwords": "OpenShift",
+            "condition_on_previous_text": False,
+            "compression_ratio_threshold": 2.0,
+            "no_speech_threshold": 0.5,
+        }
+
+
+class TestThreadEnv:
+    """OMP_NUM_THREADS / MKL_NUM_THREADS count as an explicit --threads."""
+
+    @pytest.fixture
+    def seen(self, monkeypatch) -> dict:
+        seen: dict = {}
+        monkeypatch.setattr(
+            pipeline_mod.asr_mod, "apply_torch_threads", lambda n: seen.__setitem__("torch", n)
+        )
+        return seen
+
+    def test_env_limit_applies_to_every_stage(self, fake_input, seen, monkeypatch, caplog):
+        monkeypatch.setenv("OMP_NUM_THREADS", "4")
+        plan = pipeline_mod.asr_mod.DevicePlan(asr="cuda", torch="cuda", vad="cuda")
+        with caplog.at_level("INFO", logger="transcript_video.pipeline"):
+            assert pipeline_mod._configure_threads(_config(fake_input), plan) == 4
+        assert seen == {"torch": 4}
+        assert "CPU threads: 4 (from OMP_NUM_THREADS)" in caplog.text
+
+    def test_cli_threads_beat_the_env(self, fake_input, seen, monkeypatch):
+        monkeypatch.setenv("OMP_NUM_THREADS", "4")
+        config = _config(fake_input)
+        config.threads = 2
+        plan = pipeline_mod.asr_mod.DevicePlan(asr="cpu", torch="cpu", vad="cpu")
+        assert pipeline_mod._configure_threads(config, plan) == 2
+        assert seen == {"torch": 2}
+
+    def test_no_env_keeps_the_default_policy(self, fake_input, seen, monkeypatch):
+        monkeypatch.setattr(pipeline_mod.asr_mod, "available_cpu_count", lambda: 8)
+        plan = pipeline_mod.asr_mod.DevicePlan(asr="cuda", torch="cuda", vad="cuda")
+        assert pipeline_mod._configure_threads(_config(fake_input), plan) is None
+        assert seen == {}
+
+
+class TestThreadPolicyEdges:
+    def test_zero_threads_in_runconfig_is_auto(self, stub_pipeline, fake_input, monkeypatch):
+        """RunConfig(threads=0) on a GPU run keeps library defaults, like None."""
+        seen: dict[str, object] = {}
+        monkeypatch.setattr(
+            pipeline_mod.asr_mod, "apply_torch_threads", lambda n: seen.__setitem__("torch", n)
+        )
+        config = _config(fake_input, write_md=False)
+        config.threads = 0
+        pipeline_mod.run_pipeline(config)
+        assert "torch" not in seen
+
+    def test_cpu_vad_gets_cpu_threads_even_with_torch_on_cuda(self, fake_input, monkeypatch):
+        """ASR + VAD on CPU, alignment/diarization on CUDA: torch still does CPU work."""
+        seen: dict[str, object] = {}
+        monkeypatch.setattr(pipeline_mod.asr_mod, "available_cpu_count", lambda: 8)
+        monkeypatch.setattr(
+            pipeline_mod.asr_mod, "apply_torch_threads", lambda n: seen.__setitem__("torch", n)
+        )
+        plan = pipeline_mod.asr_mod.DevicePlan(asr="cpu", torch="cuda", vad="cpu")
+        config = _config(fake_input, write_md=False)
+        assert pipeline_mod._configure_threads(config, plan) == 7
+        assert seen == {"torch": 7}
+
+    def test_no_stage_logs_nothing_about_threads(self, fake_input, caplog):
+        plan = pipeline_mod.asr_mod.DevicePlan(asr=None, torch=None)
+        config = _config(fake_input, write_md=False)
+        config.threads = 4
+        with caplog.at_level("INFO", logger="transcript_video.pipeline"):
+            assert pipeline_mod._configure_threads(config, plan) is None
+        assert "CPU threads" not in caplog.text
+
+
+class TestBatchSize:
+    """ASR batch size: 16 on CUDA, 4 on CPU, explicit value wins."""
+
+    @pytest.fixture
+    def seen_batch(self, monkeypatch) -> dict[str, int]:
+        seen: dict[str, int] = {}
+
+        class FakeModel:
+            def transcribe(self, audio, batch_size, **kwargs):
+                seen["batch_size"] = batch_size
+                return {"language": "it", "segments": [{"start": 0.0, "end": 1.0, "text": "x"}]}
+
+        monkeypatch.setattr(
+            pipeline_mod.asr_mod, "load_whisperx_model", lambda *a, **kw: FakeModel()
+        )
+        return seen
+
+    @staticmethod
+    def _on_cpu(monkeypatch):
+        monkeypatch.setattr(pipeline_mod.asr_mod, "check_cuda_available", lambda: (False, None))
+        monkeypatch.setattr(pipeline_mod.asr_mod, "torch_cuda_available", lambda: False)
+
+    def test_cuda_default_is_16(self, stub_pipeline, seen_batch, fake_input):
+        config = _config(fake_input, write_md=False)
+        config.beam_size = 10
+        pipeline_mod.run_pipeline(config)
+        assert seen_batch == {"batch_size": 16}
+
+    def test_cpu_default_is_4(self, stub_pipeline, seen_batch, fake_input, monkeypatch):
+        self._on_cpu(monkeypatch)
+        config = _config(fake_input, write_md=False)
+        config.beam_size = 10
+        pipeline_mod.run_pipeline(config)
+        assert seen_batch == {"batch_size": 4}
+
+    def test_explicit_batch_size_wins_on_cpu(self, stub_pipeline, seen_batch, fake_input, monkeypatch):
+        self._on_cpu(monkeypatch)
+        config = _config(fake_input, write_md=False)
+        config.beam_size = 10
+        config.batch_size = 3
+        pipeline_mod.run_pipeline(config)
+        assert seen_batch == {"batch_size": 3}
+
+
+class TestMemoryLog:
+    def test_reads_rss_and_peak_from_proc_status(self, tmp_path):
+        status = tmp_path / "status"
+        status.write_text("Name:\tpython\nVmHWM:\t 3145728 kB\nVmRSS:\t 1048576 kB\n")
+        assert pipeline_mod._read_memory_gb(status) == (1.0, 3.0)
+
+    def test_missing_status_file_is_none(self, tmp_path):
+        assert pipeline_mod._read_memory_gb(tmp_path / "nope") is None
+
+
+class TestAudioDecodedOnce:
+    """The waveform decoded for ASR feeds diarization and embeddings too."""
+
+    @pytest.fixture
+    def seen(self, monkeypatch, fake_audio) -> dict:
+        seen: dict = {"loads": 0}
+
+        def _load(_path):
+            seen["loads"] += 1
+            return fake_audio
+
+        def _diarize(aligned, audio, **kwargs):
+            seen["diarize_audio"] = audio
+            return {"segments": aligned["segments"], "word_segments": []}
+
+        def _extract(audio_path, segments, **kwargs):
+            seen["embed_audio"] = kwargs.get("audio")
+            return {}
+
+        monkeypatch.setattr(pipeline_mod.asr_mod, "load_audio", _load)
+        monkeypatch.setattr(pipeline_mod.diarize_mod, "diarize_and_assign", _diarize)
+        monkeypatch.setattr(
+            pipeline_mod.speaker_embed_mod, "extract_cluster_embeddings", _extract
+        )
+        return seen
+
+    def test_full_run_decodes_once(self, stub_pipeline, seen, fake_input, fake_audio):
+        pipeline_mod.run_pipeline(_config(fake_input, write_md=False))
+        assert seen["loads"] == 1
+        assert seen["diarize_audio"] is fake_audio
+        assert seen["embed_audio"] is fake_audio
+
+    def test_resume_decodes_once_and_reuses_for_embeddings(
+        self, stub_pipeline, seen, fake_input, fake_audio, tmp_path
+    ):
+        # First run writes the aligned snapshot; reset the counter, then resume.
+        pipeline_mod.run_pipeline(_config(fake_input, write_md=False))
+        snapshot = pipeline_mod._resolve_output_paths(_config(fake_input))["aligned"]
+        seen["loads"] = 0
+
+        config = _config(fake_input, write_md=False)
+        config.resume_from_aligned = snapshot
+        pipeline_mod.run_pipeline(config)
+
+        assert seen["loads"] == 1
+        assert seen["diarize_audio"] is fake_audio
+        assert seen["embed_audio"] is fake_audio
 
 
 class TestPayloadConstruction:

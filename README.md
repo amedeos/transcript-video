@@ -8,7 +8,7 @@
 
 Transcribe and diarize video/audio using [whisperX](https://github.com/m-bain/whisperX) — which combines [faster-whisper](https://github.com/SYSTRAN/faster-whisper) with wav2vec2 forced alignment and [pyannote.audio](https://github.com/pyannote/pyannote-audio) speaker diarization — and emit JSON, SRT, plain text, and a human-readable Markdown transcript with YAML frontmatter.
 
-This project is the English-language successor of [transcript-italian-video](https://github.com/amedeos/transcript-italian-video). It keeps every optimization from the reference (initial prompt, hotwords, anti-loop) and adds:
+This project is the English-language successor of [transcript-italian-video](https://github.com/amedeos/transcript-italian-video). It keeps the reference's initial prompt and hotwords (and accepts its `--anti-loop` flag, which whisperX's batched decoding currently ignores; see the options table) and adds:
 
 - **Speaker diarization** via pyannote (whisperX integration).
 - **Language autodetect** by default (`--language` still available to force).
@@ -27,7 +27,8 @@ This project is the English-language successor of [transcript-italian-video](htt
 
 - Python 3.10+
 - ffmpeg available on `$PATH`
-- For GPU runs: NVIDIA driver + CUDA (≥10 GB VRAM recommended; 16 GB+ for `large-v3`)
+- For GPU runs: NVIDIA driver + CUDA (≥10 GB VRAM recommended; 16 GB+ for `large-v3`). Minimum for the ASR: a GPU with float16 support (compute capability 7.0+: GTX 16xx, RTX 20xx and newer). On an older GPU (e.g. GTX 10xx), `--device auto` runs the ASR on CPU in float32, which is lossless but slower, while alignment and diarization still use the GPU. An explicit `--device cuda` uses the old GPU for the ASR anyway, in float32.
+- CPU-only machines work too, with no accuracy loss but much slower — see [Running on CPU only](#running-on-cpu-only)
 - For diarization: a HuggingFace account with the diarization model's terms accepted, plus an HF token. whisperX's current default is [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1); the older [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) is also supported via `--diarize-model`. **Both are gated repos** — visit the model page once and click "Agree and access repository" before running diarization, otherwise the pipeline aborts with a 403 GatedRepo error.
 - For the speaker-embedding cache (used by `transcript-learn`): the pipeline also fetches [pyannote/wespeaker-voxceleb-resnet34-LM](https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM) when diarization is enabled. The pre-flight check warns if access is missing; if it is, the embedding cache is skipped non-fatally and the rest of the pipeline proceeds.
 
@@ -120,8 +121,10 @@ pyannote computes a speaker embedding for every 10 s window and each of its (up 
 |------|-------------|---------|
 | `--model NAME` | whisperX model | `large-v3` |
 | `--beam_size N` | Beam search width | `5` |
-| `--device {auto,cuda,cpu}` | Device | `auto` |
-| `--compute-type TYPE` | Override (e.g. `int8`, `float16`) | auto |
+| `--device {auto,cuda,cpu}` | Device. `auto` uses the GPU when one is usable, otherwise CPU. `cuda` stops with an error if no GPU is usable | `auto` |
+| `--compute-type TYPE` | Override (e.g. `int8`, `float16`; any case). Only ctranslate2's types are accepted, so a typo stops with an error. A type the device can't run is replaced, with a warning: `int8*` by the closest supported `int8*` type, anything else by the device default. `auto` and `default` mean the lossless default below | `float16` on CUDA, `float32` on CPU |
+| `--threads N` | CPU threads for ASR, alignment and diarization. `0` means auto (undoes a config value). Without it, `OMP_NUM_THREADS` (or `MKL_NUM_THREADS`) counts as an explicit N | logical CPUs − 1 (capped by a container CPU quota) for stages on CPU; library defaults for stages on GPU |
+| `--batch-size N` | ASR chunks decoded at once. Changes speed and RAM, not accuracy: the text can differ only by floating-point noise, and the value is recorded in the JSON. Lower it if the run is killed for lack of memory. `0` means auto | `16` on CUDA, `4` on CPU |
 
 **Language**
 
@@ -149,7 +152,7 @@ pyannote computes a speaker embedding for every 10 s window and each of its (up 
 
 | Flag | Description |
 |------|-------------|
-| `--anti-loop` | `condition_on_previous_text=False`, `compression_ratio_threshold=2.0`, `no_speech_threshold=0.5` — apply when you observe Whisper's cyclic hallucinations |
+| `--anti-loop` | `condition_on_previous_text=False`, `compression_ratio_threshold=2.0`, `no_speech_threshold=0.5`, from the reference project. With whisperX's batched decoding these currently have no effect: each 30 s chunk is already decoded on its own, without conditioning on the previous text |
 
 **Verbosity**
 
@@ -174,7 +177,7 @@ After alignment, an `*_transcript.aligned.json` snapshot is written automaticall
 
 | Flag | Description |
 |------|-------------|
-| `--resume-from-aligned PATH` | Skip ASR + alignment; load the snapshot, run diarization, write outputs. The source video path is read from the snapshot if not given as a positional. |
+| `--resume-from-aligned PATH` | Skip ASR + alignment; load the snapshot, run diarization, write outputs. The source video path is read from the snapshot if not given as a positional. Also accepts the `*_transcript.json` of a `--no-diarize` run, to add speakers later; a transcript that already has speakers is refused (use `transcript-to-md` to re-render it). |
 
 **Project config**
 
@@ -359,7 +362,7 @@ All outputs default to the input directory with the suffix `_transcript`. With `
 
 ```jsonc
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "stage": "complete",
   "source_file": "/abs/path/video.mp4",
   "transcribed_at": "2026-05-05T10:30:00",
@@ -370,6 +373,7 @@ All outputs default to the input directory with the suffix `_transcript`. With `
     "device": "cuda",
     "compute_type": "float16",
     "beam_size": 5,
+    "batch_size": 16,
     "vad_filter": true,
     "language_forced": null,
     "initial_prompt": null,
@@ -481,7 +485,18 @@ Activate a profile with `--profile NAME`:
 transcript-from-video video.mp4 --profile meeting --md
 ```
 
-CLI flags always override the config. The config provides defaults; it never restricts.
+CLI flags always override the config. The config provides defaults; it never restricts. Each value is checked like the matching CLI flag: `beam_size = 5.5` or `device = "gpu"` stops with an error naming the key, instead of failing later in the pipeline.
+
+## Running on CPU only
+
+No NVIDIA GPU is required. With the default `--device auto` the pipeline uses the GPU when one is usable and switches to CPU on its own otherwise, so the same command works on a GPU desktop and on a laptop. An explicit `--device cuda` (or `device = "cuda"` in the config file) means "GPU or nothing": without a usable GPU the run stops at start-up with an error instead of quietly running for hours on CPU. Keep `device` out of a config file you share between machines.
+
+- **No accuracy loss by default.** On CPU the ASR runs in `float32`, which is at least as precise as the `float16` used on GPU (ctranslate2 has no `float16` on CPU). Alignment (wav2vec2) and diarization (pyannote) run in `float32` on both devices. Expect small numeric differences between machines, not worse transcripts.
+- **Threads.** By default stages running on CPU use all logical CPUs but one, which leaves the machine responsive. Inside a container with a CPU quota (`podman run --cpus=4`), the quota counts as the number of CPUs. Stages running on the GPU keep their libraries' own defaults. Override with `--threads N` or `threads = N` in the config file, which applies to every stage. A thread limit set in the environment (`OMP_NUM_THREADS`, else `MKL_NUM_THREADS`), as on a shared server, is honored the same way when `--threads` isn't given, and the log says where the count comes from.
+- **RAM.** `large-v3` in `float32` needs about 6 GB for the model weights alone. On top of that, each chunk in the ASR batch adds about 0.65 GB (estimate). That is why the CPU default is `--batch-size 4` (roughly 10 GB peak) instead of the GPU's 16 (roughly 18 GB, more with a wide beam). The batch doesn't cost accuracy (results can differ only by floating-point noise): raise it for speed if you have RAM to spare, lower it to `1` (roughly 8 GB) on a tight machine. `--beam_size` costs mostly time; its RAM cost shows up only at high batch sizes. The ASR model is freed before alignment and diarization load their own models, and the log prints `RAM after …` at each stage.
+- **Faster, lighter, slightly less accurate.** Pass `--compute-type int8`: about 4× less memory for the weights and faster, at a small accuracy cost on hard audio (noise, overlapping speakers, proper names). Picking a smaller `--model` costs much more accuracy than `int8`. `large-v3-turbo` is the usual compromise; avoid `distil-*` models for non-English audio.
+- **Resuming across machines.** `--resume-from-aligned` picks the device from the current machine and the current `--device`, not from the snapshot: you can run ASR on a GPU box and diarize on a laptop, or the other way round. `parameters.device` / `compute_type` in the JSON keep recording what the ASR ran with.
+- **Two libraries, two GPU checks.** ASR uses ctranslate2; alignment, diarization and embeddings use torch. Each is checked on its own. With `auto`, a library that can't use CUDA (e.g. a CPU-only torch wheel) runs its stages on CPU and the log says so; whisperX's voice-activity detection, a torch model, then runs on CPU while the ASR keeps the GPU. With `cuda`, every library that has work to do must be able to use the GPU (a `--resume-from-aligned` runs no ASR, so it only needs torch).
 
 ## Container (Podman / Docker)
 
@@ -508,7 +523,7 @@ podman run --rm \
 
 The container's working directory is `/data`, so paths in the command line are relative to the host directory bind-mounted there. The HuggingFace cache is shared with the host so the diarization model is downloaded once across runs.
 
-For CPU-only execution, drop `--device nvidia.com/gpu=all` and pass `--device cpu` to `transcript-from-video` inside the container (slow — only sensible for short clips or smoke tests).
+For CPU-only execution, drop `--device nvidia.com/gpu=all` and don't pass `--device cuda`: with the default `--device auto` the pipeline falls back to CPU on its own (see [Running on CPU only](#running-on-cpu-only)). It is much slower than a GPU. A `--cpus` quota on the container is respected by the default thread count.
 
 ### Rootless podman: keep host groups for GPU access
 
@@ -536,6 +551,16 @@ If you authenticated on the host with `huggingface-cli login`, the token lives i
 
 ### CUDA not detected
 
+With the default `--device auto` a missing GPU doesn't stop the run: the pipeline falls back to CPU, which is much slower. To check that both GPU users (ctranslate2 for ASR, torch for alignment/diarization) can see CUDA, run the pre-flight with `--device cuda`:
+
+```bash
+transcript-from-video --check --device cuda
+# [OK  ] cuda   available (compute_type hint: float16)                    ← GPU in use
+# [FAIL] cuda   device 'cuda' was requested (--device or config) but alignment/diarization (torch) cannot use a CUDA device. ...   ← names the library
+```
+
+The probe only checks that each library sees a CUDA device. If it reports `available` but the model load then fails on missing CUDA libraries (e.g. `libcudnn`), the CUDA wheels are missing: install the `[cuda]` extra. If it fails:
+
 ```bash
 nvidia-smi
 uv pip install -e ".[cuda]" --force-reinstall
@@ -556,12 +581,16 @@ The diarization model is gated — you must accept its terms on huggingface.co b
 
 whisperX ships alignment models for a fixed list of languages. If yours is missing, the pipeline keeps going with segment-level (not word-level) timestamps; the Markdown speaker boundaries may be slightly less precise.
 
-### GPU memory pressure
+### Out of memory (GPU or CPU)
 
-Switch to a smaller model:
+On CPU the symptom is a bare `Killed` (the kernel's OOM killer), usually during ASR. The `RAM after …` log lines show how much each stage used. Try these in order. The first costs no accuracy; the other two trade accuracy for memory:
+
+1. **Lower the batch**: `--batch-size 1` (or `2`). It costs speed, not accuracy, and it is the main lever: ASR memory grows mostly with the batch. A wide `--beam_size` adds a few GB only at high batch sizes.
+2. **Quantize**: `--compute-type int8` makes the weights about 4× smaller, at a small accuracy cost on hard audio.
+3. **Smaller model**: `--model large-v3-turbo` or `--model medium`. This costs the most accuracy.
 
 ```bash
-transcript-from-video video.mp4 --model medium
+transcript-from-video video.mp4 --batch-size 1
 ```
 
 ## License

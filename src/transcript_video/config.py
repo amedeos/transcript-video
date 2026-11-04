@@ -53,6 +53,8 @@ class RunConfig:
     beam_size: int = 5
     device: str | None = None  # ``cuda`` / ``cpu`` / ``None`` = auto.
     compute_type: str | None = None  # Override (e.g. ``int8_float16``); ``None`` = auto.
+    threads: int | None = None  # CPU threads; ``None`` = logical CPUs - 1.
+    batch_size: int | None = None  # ASR batch; ``None`` = 16 on CUDA, 4 on CPU.
     language: str | None = None  # ``None`` = autodetect.
 
     initial_prompt: str | None = None  # ``None`` = unset, ``""`` = explicitly disabled.
@@ -69,3 +71,13 @@ class RunConfig:
     # When set, ASR + alignment are skipped and the pipeline jumps straight to
     # diarization (if enabled) and the final outputs.
     resume_from_aligned: Path | None = None
+
+    @property
+    def runs_asr(self) -> bool:
+        """ASR + alignment run (not a resume)."""
+        return self.resume_from_aligned is None
+
+    @property
+    def runs_torch(self) -> bool:
+        """A torch stage runs: VAD + alignment with the ASR, or diarization."""
+        return self.runs_asr or self.diarization.enabled

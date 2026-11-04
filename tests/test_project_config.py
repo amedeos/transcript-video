@@ -179,3 +179,72 @@ class TestResolve:
         assert flat["tags"] == ["alpha", "beta"]
         assert smap == {"SPEAKER_00": "Anna"}
         assert path is not None
+
+
+class TestApplyToParser:
+    """Config values are checked against their flag like CLI input."""
+
+    @staticmethod
+    def _parser():
+        import argparse
+
+        p = argparse.ArgumentParser()
+        p.add_argument("--beam_size", type=int, default=5)
+        p.add_argument("--id-threshold", type=float, default=0.65)
+        p.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+        p.add_argument("--compute-type", default=None)
+        p.add_argument("--date", dest="fm_date", default=None)
+        p.add_argument("--anti-loop", action="store_true")
+        p.add_argument("--tag", dest="tags", action="append")
+        return p
+
+    def _apply(self, **values):
+        p = self._parser()
+        applied, ignored = project_config.apply_to_parser(p, values)
+        return p.parse_args([]), applied, ignored
+
+    def test_valid_values_become_defaults(self):
+        args, applied, ignored = self._apply(
+            beam_size=10, id_threshold=1, device="cpu", anti_loop=True, tags=["a", "b"], extra=1
+        )
+        assert (args.beam_size, args.id_threshold, args.device) == (10, 1.0, "cpu")
+        assert args.anti_loop is True and args.tags == ["a", "b"]
+        assert applied == {"beam_size", "id_threshold", "device", "anti_loop", "tags"}
+        assert ignored == {"extra"}
+
+    def test_numeric_string_is_converted_like_the_cli(self):
+        args, _, _ = self._apply(beam_size="7")
+        assert args.beam_size == 7
+
+    def test_choices_are_case_insensitive(self):
+        args, _, _ = self._apply(device="CUDA")
+        assert args.device == "cuda"
+
+    def test_unquoted_toml_date_becomes_text(self):
+        import datetime
+
+        args, _, _ = self._apply(fm_date=datetime.date(2026, 5, 5))
+        assert args.fm_date == "2026-05-05"
+
+    def test_single_tag_string_becomes_a_list(self):
+        args, _, _ = self._apply(tags="solo")
+        assert args.tags == ["solo"]
+
+    @pytest.mark.parametrize(
+        ("key", "value", "message"),
+        [
+            ("beam_size", 5.5, "must be an integer"),
+            ("beam_size", True, "must not be a boolean"),
+            ("beam_size", "five", "must be an integer"),
+            ("id_threshold", False, "must not be a boolean"),
+            ("device", "gpu", "must be one of auto, cuda, cpu"),
+            ("compute_type", 16, "must be a string"),
+            ("anti_loop", "yes", "must be true or false"),
+            ("tags", ["ok", 3], "must be a string"),
+        ],
+    )
+    def test_invalid_values_stop_with_the_key_name(self, capsys, key, value, message):
+        with pytest.raises(SystemExit):
+            self._apply(**{key: value})
+        err = capsys.readouterr().err
+        assert f"config '{key}'" in err and message in err
