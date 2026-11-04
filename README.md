@@ -6,12 +6,12 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![Status: Alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#)
 
-Transcribe and diarize video/audio using [whisperX](https://github.com/m-bain/whisperX) — which combines [faster-whisper](https://github.com/SYSTRAN/faster-whisper) with wav2vec2 forced alignment and [pyannote.audio](https://github.com/pyannote/pyannote-audio) speaker diarization — and emit JSON, SRT, plain text, and a human-readable Markdown transcript with YAML frontmatter.
+Transcribe and diarize video/audio using [whisperX](https://github.com/m-bain/whisperX) — which combines [faster-whisper](https://github.com/SYSTRAN/faster-whisper) with wav2vec2 forced alignment and [pyannote.audio](https://github.com/pyannote/pyannote-audio) speaker diarization — and emit JSON, SRT, plain text, and a human-readable Markdown transcript with YAML frontmatter. On a machine without a float16 GPU the speech recognition runs [NVIDIA Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) on CPU through [onnx-asr](https://github.com/istupakov/onnx-asr) instead, about 4× faster than whisperX large-v3 there (see [Running on CPU only](#running-on-cpu-only)).
 
 This project is the English-language successor of [transcript-italian-video](https://github.com/amedeos/transcript-italian-video). It keeps the reference's initial prompt and hotwords (and accepts its `--anti-loop` flag, which whisperX's batched decoding currently ignores; see the options table) and adds:
 
 - **Speaker diarization** via pyannote (whisperX integration).
-- **Language autodetect** by default (`--language` still available to force).
+- **Language autodetect** by default (`--language` still available to force with whisperX; Parakeet always detects it).
 - **Output policy reversal**: JSON is always written; SRT, TXT, and Markdown are opt-in.
 - **Markdown export with YAML frontmatter and speaker headings** (`--md`), including an inline or sidecar speaker-name map.
 - **Re-render path**: a separate `transcript-to-md` binary regenerates the Markdown from an existing JSON without loading any model.
@@ -27,8 +27,8 @@ This project is the English-language successor of [transcript-italian-video](htt
 
 - Python 3.10+
 - ffmpeg available on `$PATH`
-- For GPU runs: NVIDIA driver + CUDA (≥10 GB VRAM recommended; 16 GB+ for `large-v3`). Minimum for the ASR: a GPU with float16 support (compute capability 7.0+: GTX 16xx, RTX 20xx and newer). On an older GPU (e.g. GTX 10xx), `--device auto` runs the ASR on CPU in float32, which is lossless but slower, while alignment and diarization still use the GPU. An explicit `--device cuda` uses the old GPU for the ASR anyway, in float32.
-- CPU-only machines work too, with no accuracy loss but much slower — see [Running on CPU only](#running-on-cpu-only)
+- For GPU runs: NVIDIA driver + CUDA (≥10 GB VRAM recommended; 16 GB+ for `large-v3`). Minimum for the ASR: a GPU with float16 support (compute capability 7.0+: GTX 16xx, RTX 20xx and newer). On an older GPU (e.g. GTX 10xx), the default `--model auto` runs Parakeet on CPU, while diarization still uses the GPU. `--model large-v3 --device cuda` uses the old GPU for whisperX anyway, in float32.
+- CPU-only machines work too: Parakeet by default (fast), or whisperX `large-v3` on request (no accuracy loss, much slower). See [Running on CPU only](#running-on-cpu-only)
 - For diarization: a HuggingFace account with the diarization model's terms accepted, plus an HF token. whisperX's current default is [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1); the older [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) is also supported via `--diarize-model`. **Both are gated repos** — visit the model page once and click "Agree and access repository" before running diarization, otherwise the pipeline aborts with a 403 GatedRepo error.
 - For the speaker-embedding cache (used by `transcript-learn`): the pipeline also fetches [pyannote/wespeaker-voxceleb-resnet34-LM](https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM) when diarization is enabled. The pre-flight check warns if access is missing; if it is, the embedding cache is skipped non-fatally and the rest of the pipeline proceeds.
 
@@ -85,17 +85,22 @@ JSON is always produced. SRT, TXT, and Markdown are opt-in.
 #### Examples
 
 ```bash
-# Minimal: autodetect language, JSON only, diarization on
+# Minimal: autodetect language, JSON only, diarization on.
+# whisperX large-v3 on a float16 GPU, Parakeet on CPU (--model auto)
 transcript-from-video video.mp4
+
+# Parakeet anywhere (e.g. to compare it with large-v3 on a GPU machine)
+transcript-from-video video.mp4 --model parakeet --basename pk
 
 # All artifacts
 transcript-from-video video.mp4 --srt --txt --md
 
-# Force English, higher-accuracy beam, anti-loop mitigations
-transcript-from-video interview.mp4 --language en --beam_size 10 --anti-loop
+# whisperX options (language, beam, anti-loop, prompt, hotwords) need a whisper
+# model: with Parakeet they stop the run, so name the model on CPU machines
+transcript-from-video interview.mp4 --model large-v3 --language en --beam_size 10 --anti-loop
 
 # Initial prompt for style/glossary, hotwords for proper nouns
-transcript-from-video podcast.mp4 \
+transcript-from-video podcast.mp4 --model large-v3 \
   --prompt "Glossary: API, GPU, microservices, Kubernetes." \
   --hotwords "Anthropic Claude faster-whisper"
 
@@ -115,8 +120,8 @@ transcript-from-video lecture.mp4 --no-diarize --txt --srt
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--model NAME` | whisperX model | `large-v3` |
-| `--beam_size N` | Beam search width | `5` |
+| `--model NAME` | `auto`: whisperX `large-v3` when the ASR can run on a float16 GPU (or `--device cuda` was asked), otherwise Parakeet on CPU. `parakeet`: NVIDIA Parakeet TDT 0.6B v3, always on CPU (ONNX Runtime), 25 European languages detected automatically. Any other value is a whisperX model (`large-v3`, `small`, ...) | `auto` |
+| `--beam_size N` | Beam search width (whisperX only) | `5` |
 | `--device {auto,cuda,cpu}` | Device. `auto` uses the GPU when one is usable, otherwise CPU. `cuda` stops with an error if no GPU is usable | `auto` |
 | `--compute-type TYPE` | Override (e.g. `int8`, `float16`; any case). Only ctranslate2's types are accepted, so a typo stops with an error. A type the device can't run is replaced, with a warning: `int8*` by the closest supported `int8*` type, anything else by the device default. `auto` and `default` mean the lossless default below | `float16` on CUDA, `float32` on CPU |
 | `--threads N` | CPU threads for ASR, alignment and diarization. `0` means auto (undoes a config value). Without it, `OMP_NUM_THREADS` (or `MKL_NUM_THREADS`) counts as an explicit N | logical CPUs − 1 (capped by a container CPU quota) for stages on CPU; library defaults for stages on GPU |
@@ -126,9 +131,9 @@ transcript-from-video lecture.mp4 --no-diarize --txt --srt
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--language CODE` | Force a language code | autodetect |
+| `--language CODE` | Force a language code (whisperX only: Parakeet detects the language itself, and `--language` with Parakeet stops the run) | autodetect |
 
-**Initial prompt** (mutex, opt-in — same semantics as the reference project)
+**Initial prompt** (mutex, opt-in — same semantics as the reference project; whisperX only)
 
 | Flag | Description |
 |------|-------------|
@@ -136,7 +141,7 @@ transcript-from-video lecture.mp4 --no-diarize --txt --srt
 | `--prompt-file PATH` | Read prompt from a UTF-8 file |
 | `--no-prompt` | Explicitly disable |
 
-**Hotwords** (mutex, opt-in)
+**Hotwords** (mutex, opt-in; whisperX only)
 
 | Flag | Description |
 |------|-------------|
@@ -144,11 +149,13 @@ transcript-from-video lecture.mp4 --no-diarize --txt --srt
 | `--hotwords-file PATH` | Read hotwords from a UTF-8 file |
 | `--no-hotwords` | Explicitly disable |
 
-**Decoding**
+**Decoding** (whisperX only)
 
 | Flag | Description |
 |------|-------------|
 | `--anti-loop` | `condition_on_previous_text=False`, `compression_ratio_threshold=2.0`, `no_speech_threshold=0.5`, from the reference project. With whisperX's batched decoding these currently have no effect: each 30 s chunk is already decoded on its own, without conditioning on the previous text |
+
+With Parakeet (`--model parakeet`, or `--model auto` on CPU) the prompt, hotwords, `--language`, an explicit `--beam_size` and `--anti-loop` **stop the run** at start-up, with a message naming the option: Parakeet can't apply any of them. `--no-prompt` / `--no-hotwords` are fine. To use them on CPU, pass `--model large-v3`.
 
 **Verbosity**
 
@@ -159,7 +166,7 @@ transcript-from-video lecture.mp4 --no-diarize --txt --srt
 
 **Pre-flight checks**
 
-By default a pre-flight runs at the start of every transcription. It validates ffmpeg / CUDA / HF token / gated-model access / whisperX API in 1–2 seconds, before the model is loaded.
+By default a pre-flight runs at the start of every transcription. It validates ffmpeg / CUDA / the ASR engine and its options / Parakeet's onnx-asr and model files (when Parakeet runs) / HF token / gated-model access / whisperX API in 1–2 seconds, before the model is loaded.
 
 | Flag | Description |
 |------|-------------|
@@ -358,7 +365,7 @@ All outputs default to the input directory with the suffix `_transcript`. With `
 
 ```jsonc
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "stage": "complete",
   "source_file": "/abs/path/video.mp4",
   "transcribed_at": "2026-05-05T10:30:00",
@@ -366,11 +373,13 @@ All outputs default to the input directory with the suffix `_transcript`. With `
     "backend": "whisperx",
     "asr": "whisperx-large-v3",
     "model": "large-v3",
+    "model_revision": null,
     "device": "cuda",
     "compute_type": "float16",
     "beam_size": 5,
     "batch_size": 16,
     "vad_filter": true,
+    "vad": null,
     "language_forced": null,
     "initial_prompt": null,
     "hotwords": null,
@@ -411,6 +420,8 @@ All outputs default to the input directory with the suffix `_transcript`. With `
 }
 ```
 
+With Parakeet, `backend` is `onnx-asr`, `model` is `parakeet-tdt-0.6b-v3`, `model_revision` is the pinned HuggingFace commit, `vad` holds the Silero settings, and the whisperX-only values (`beam_size`, `language_forced`, prompt, hotwords, anti-loop, `suspect_thresholds`) and `audio_info.language_detected` are `null`. Its segments carry `token_logprob` and its words `logprob` (mean token log-probabilities) instead of whisperX's confidences, and none is flagged as suspect.
+
 `speaker_clusters` is populated only when diarization is enabled and the embedding extraction succeeds; otherwise empty `{}`. It's the cache read by `transcript-learn` and by `--identify-speakers`. `speaker_identities` is populated only when `--identify-speakers` was passed (at pipeline time or re-render time); each entry tracks whether it came from the DB (`source: "auto"`) or from an explicit `--speaker-map` (`source: "manual"`). See [Speaker enrollment and auto-identification](#speaker-enrollment-and-auto-identification).
 
 ### Markdown
@@ -445,6 +456,10 @@ Persist per-project flags so you don't retype them every run. Place a `transcrip
 ```toml
 # Top-level keys map to argparse `dest` names — same shape as the CLI flags
 # but with underscores instead of dashes.
+# beam_size, anti_loop, hotwords, prompt and language are whisperX options:
+# with Parakeet (what --model auto runs on CPU) they stop the run, so a config
+# that sets them pins a whisper model.
+model           = "large-v3"
 beam_size       = 10
 anti_loop       = true
 diarize_model   = "pyannote/speaker-diarization-3.1"
@@ -485,12 +500,14 @@ CLI flags always override the config. The config provides defaults; it never res
 
 ## Running on CPU only
 
-No NVIDIA GPU is required. With the default `--device auto` the pipeline uses the GPU when one is usable and switches to CPU on its own otherwise, so the same command works on a GPU desktop and on a laptop. An explicit `--device cuda` (or `device = "cuda"` in the config file) means "GPU or nothing": without a usable GPU the run stops at start-up with an error instead of quietly running for hours on CPU. Keep `device` out of a config file you share between machines.
+No NVIDIA GPU is required. With the default `--device auto` the pipeline uses the GPU when one is usable and switches to CPU on its own otherwise, so the same command works on a GPU desktop and on a laptop. With the default `--model auto`, "CPU" also means a different speech recognizer: Parakeet instead of whisperX. An explicit `--device cuda` (or `device = "cuda"` in the config file) means "GPU or nothing": without a usable GPU the run stops at start-up with an error instead of quietly running for hours on CPU. Keep `device` out of a config file you share between machines.
 
-- **No accuracy loss by default.** On CPU the ASR runs in `float32`, which is at least as precise as the `float16` used on GPU (ctranslate2 has no `float16` on CPU). Alignment (wav2vec2) and diarization (pyannote) run in `float32` on both devices. Expect small numeric differences between machines, not worse transcripts.
+- **Parakeet by default.** Without a float16 GPU, `--model auto` runs NVIDIA Parakeet TDT 0.6B v3 on CPU through ONNX Runtime. On a laptop (i7-1280P, 6 threads) it transcribed at 0.40× the audio length, against ~1.6× for whisperX `large-v3`, so a 40-minute call takes about 16 minutes instead of an hour. It needs no alignment stage (it has its own word timestamps) and peaks around 3.5 GB of RAM in float32. On a 2-minute Italian test clip its words matched `large-v3`'s at 89%. The differences were partly whisperX's errors and partly Parakeet's, which misses domain jargon and takes no prompt or hotwords to fix it. It detects the language by itself, among 25 European languages, and can't be told which one. The options it can't apply stop the run (see [Argument groups](#argument-groups)). Its files (2.5 GB in float32, 670 MB with `--compute-type int8`) are downloaded on the first run, at pinned revisions, into `~/.cache/huggingface/transcript-video/`. Pass `--model large-v3` for whisperX on CPU.
+- **Hybrid Intel laptops.** On a CPU with performance and efficiency cores, `threads = 6` (the performance cores) beat the default of all CPUs but one. Set it in the config file on such a laptop.
+- **whisperX on CPU: no accuracy loss.** With `--model large-v3` on CPU the ASR runs in `float32`, which is at least as precise as the `float16` used on GPU (ctranslate2 has no `float16` on CPU). Alignment (wav2vec2) and diarization (pyannote) run in `float32` on both devices. Expect small numeric differences between machines, not worse transcripts.
 - **Threads.** By default stages running on CPU use all logical CPUs but one, which leaves the machine responsive. Inside a container with a CPU quota (`podman run --cpus=4`), the quota counts as the number of CPUs. Stages running on the GPU keep their libraries' own defaults. Override with `--threads N` or `threads = N` in the config file, which applies to every stage. A thread limit set in the environment (`OMP_NUM_THREADS`, else `MKL_NUM_THREADS`), as on a shared server, is honored the same way when `--threads` isn't given, and the log says where the count comes from.
-- **RAM.** `large-v3` in `float32` needs about 6 GB for the model weights alone. On top of that, each chunk in the ASR batch adds about 0.65 GB (estimate). That is why the CPU default is `--batch-size 4` (roughly 10 GB peak) instead of the GPU's 16 (roughly 18 GB, more with a wide beam). The batch doesn't cost accuracy (results can differ only by floating-point noise): raise it for speed if you have RAM to spare, lower it to `1` (roughly 8 GB) on a tight machine. `--beam_size` costs mostly time; its RAM cost shows up only at high batch sizes. The ASR model is freed before alignment and diarization load their own models, and the log prints `RAM after …` at each stage.
-- **Faster, lighter, slightly less accurate.** Pass `--compute-type int8`: about 4× less memory for the weights and faster, at a small accuracy cost on hard audio (noise, overlapping speakers, proper names). Picking a smaller `--model` costs much more accuracy than `int8`. `large-v3-turbo` is the usual compromise; avoid `distil-*` models for non-English audio.
+- **RAM (whisperX).** `large-v3` in `float32` needs about 6 GB for the model weights alone. On top of that, each chunk in the ASR batch adds about 0.65 GB (estimate). That is why the CPU default is `--batch-size 4` (roughly 10 GB peak) instead of the GPU's 16 (roughly 18 GB, more with a wide beam). The batch doesn't cost accuracy (results can differ only by floating-point noise): raise it for speed if you have RAM to spare, lower it to `1` (roughly 8 GB) on a tight machine. `--beam_size` costs mostly time; its RAM cost shows up only at high batch sizes. The ASR model is freed before alignment and diarization load their own models, and the log prints `RAM after …` at each stage.
+- **Faster, lighter, slightly less accurate.** Pass `--compute-type int8`: about 4× less memory for the weights, at a small accuracy cost on hard audio (noise, overlapping speakers, proper names). With whisperX on the laptop it saved RAM but no time. With Parakeet it was faster (0.31× instead of 0.40×) but noticeably less accurate. Picking a smaller whisper `--model` costs much more accuracy than `int8`. `large-v3-turbo` is the usual compromise on a GPU (on the laptop CPU it wasn't faster: it keeps large-v3's encoder); avoid `distil-*` models for non-English audio.
 - **Resuming across machines.** `--resume-from-aligned` picks the device from the current machine and the current `--device`, not from the snapshot: you can run ASR on a GPU box and diarize on a laptop, or the other way round. `parameters.device` / `compute_type` in the JSON keep recording what the ASR ran with.
 - **Two libraries, two GPU checks.** ASR uses ctranslate2; alignment, diarization and embeddings use torch. Each is checked on its own. With `auto`, a library that can't use CUDA (e.g. a CPU-only torch wheel) runs its stages on CPU and the log says so; whisperX's voice-activity detection, a torch model, then runs on CPU while the ASR keeps the GPU. With `cuda`, every library that has work to do must be able to use the GPU (a `--resume-from-aligned` runs no ASR, so it only needs torch).
 
@@ -579,7 +596,7 @@ whisperX ships alignment models for a fixed list of languages. If yours is missi
 
 ### Out of memory (GPU or CPU)
 
-On CPU the symptom is a bare `Killed` (the kernel's OOM killer), usually during ASR. The `RAM after …` log lines show how much each stage used. Try these in order. The first costs no accuracy; the other two trade accuracy for memory:
+On CPU the symptom is a bare `Killed` (the kernel's OOM killer), usually during ASR. The `RAM after …` log lines show how much each stage used. Parakeet, the default on CPU, needs far less memory than whisperX `large-v3` (about 3.5 GB peak in float32); the tips below are mainly for whisperX. Try these in order. The first costs no accuracy; the other two trade accuracy for memory:
 
 1. **Lower the batch**: `--batch-size 1` (or `2`). It costs speed, not accuracy, and it is the main lever: ASR memory grows mostly with the batch. A wide `--beam_size` adds a few GB only at high batch sizes.
 2. **Quantize**: `--compute-type int8` makes the weights about 4× smaller, at a small accuracy cost on hard audio.
