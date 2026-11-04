@@ -156,6 +156,37 @@ class TestRunPipelineHappyPath:
         final = json.loads(pipeline_mod.run_pipeline(resume)["json"].read_text(encoding="utf-8"))
         assert final["parameters"]["batch_size"] == 2
 
+    def test_resume_keeps_the_snapshot_asr_parameters(self, stub_pipeline, fake_input, tmp_path):
+        """The ASR didn't run again: the current run's ASR flags must not relabel it."""
+        config = _config(fake_input, write_md=False)
+        config.model = "large-v3"
+        config.language = "it"
+        config.initial_prompt = "Collaudo, sviluppo."
+        config.beam_size = 10
+        pipeline_mod.run_pipeline(config)
+        snap = json.loads((tmp_path / "video_transcript.aligned.json").read_text(encoding="utf-8"))
+
+        resume = _config(fake_input, write_md=False)
+        resume.model = "small"
+        resume.language = "en"
+        resume.initial_prompt = None
+        resume.beam_size = 1
+        resume.compute_type = "int8"
+        resume.diarization = DiarizationConfig(enabled=True, hf_token="hf_fake", num_speakers=3)
+        resume.resume_from_aligned = tmp_path / "video_transcript.aligned.json"
+        final = json.loads(pipeline_mod.run_pipeline(resume)["json"].read_text(encoding="utf-8"))
+
+        params = final["parameters"]
+        expected = {k: v for k, v in snap["parameters"].items() if k != "diarization"}
+        assert {k: v for k, v in params.items() if k != "diarization"} == expected
+        assert params["model"] == "large-v3"
+        assert params["asr"] == "whisperx-large-v3"
+        assert params["language_forced"] == "it"
+        assert params["initial_prompt"] == "Collaudo, sviluppo."
+        assert params["beam_size"] == 10
+        # diarization describes the run that diarized
+        assert params["diarization"]["num_speakers"] == 3
+
     def test_resume_from_v2_snapshot_has_unknown_batch_size(
         self, stub_pipeline, fake_input, tmp_path
     ):
@@ -860,8 +891,9 @@ class TestPayloadConstruction:
             source_file=fake_input,
             transcribed_at=__import__("datetime").datetime(2026, 5, 5, 10, 0, 0),
             config=cfg,
-            device="cuda",
-            compute_type="float16",
+            asr_parameters=pipeline_mod._asr_parameters(
+                cfg, device="cuda", compute_type="float16", batch_size=None
+            ),
             detected_language="it",
             language_probability=0.95,
             segments=[{"start": 0.0, "end": 2.0, "text": "Ciao"}],
@@ -878,8 +910,9 @@ class TestPayloadConstruction:
             source_file=fake_input,
             transcribed_at=__import__("datetime").datetime(2026, 5, 5, 10, 0, 0),
             config=cfg,
-            device="cuda",
-            compute_type="float16",
+            asr_parameters=pipeline_mod._asr_parameters(
+                cfg, device="cuda", compute_type="float16", batch_size=None
+            ),
             detected_language="it",
             language_probability=0.95,
             segments=[

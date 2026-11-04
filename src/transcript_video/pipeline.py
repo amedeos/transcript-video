@@ -121,23 +121,67 @@ def _normalize_segment(seg: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _asr_parameters(
+    config: RunConfig, *, device: str, compute_type: str, batch_size: int | None
+) -> dict[str, Any]:
+    """The ``parameters`` that describe the ASR of this run (all but ``diarization``)."""
+    return {
+        "backend": "whisperx",
+        "asr": f"whisperx-{config.model}",
+        "model": config.model,
+        "device": device,
+        "compute_type": compute_type,
+        "beam_size": config.beam_size,
+        "batch_size": batch_size,
+        "vad_filter": True,
+        "language_forced": config.language,
+        "initial_prompt": config.initial_prompt or None,
+        "hotwords": config.hotwords or None,
+        "anti_loop": config.anti_loop,
+        "condition_on_previous_text": False if config.anti_loop else None,
+        "compression_ratio_threshold": 2.0 if config.anti_loop else None,
+        "no_speech_threshold": 0.5 if config.anti_loop else None,
+        "suspect_thresholds": {
+            "avg_logprob": stats_mod.DEFAULT_AVG_LOGPROB_THRESHOLD,
+            "no_speech_prob": stats_mod.DEFAULT_NO_SPEECH_PROB_THRESHOLD,
+        },
+    }
+
+
+def _snapshot_asr_parameters(payload: dict[str, Any]) -> dict[str, Any]:
+    """The ASR ``parameters`` of a snapshot, for a resume: what produced its segments.
+
+    Everything but ``diarization`` is carried as recorded. The current run's
+    model, language or prompt flags did not touch these segments, so they
+    must not relabel them. ``batch_size`` is ``None`` when a v2 snapshot
+    predates it.
+    """
+    asr = {k: v for k, v in (payload.get("parameters") or {}).items() if k != "diarization"}
+    asr.setdefault("batch_size", None)
+    return asr
+
+
 def _build_payload(
     *,
     stage: str,
     source_file: Path,
     transcribed_at: datetime,
     config: RunConfig,
-    device: str,
-    compute_type: str,
+    asr_parameters: dict[str, Any],
     detected_language: str,
     language_probability: float | None,
     segments: list[dict[str, Any]],
     processing_seconds: float,
     speaker_clusters: dict[str, Any] | None = None,
     speaker_identities: dict[str, Any] | None = None,
-    batch_size: int | None = None,
 ) -> dict[str, Any]:
     """Build the canonical JSON payload. Used for both aligned and complete stages.
+
+    ``asr_parameters`` is everything under ``parameters`` except
+    ``diarization``: what produced the segments. A fresh run builds it with
+    :func:`_asr_parameters`; a resume carries it from the snapshot
+    (:func:`_snapshot_asr_parameters`), because the ASR did not run again.
+    ``diarization`` always describes the current run.
 
     ``speaker_clusters`` is the per-speaker embedding cache produced by
     :mod:`speaker_embed` after diarization. Aligned-stage and no-diarize-stage
@@ -147,9 +191,6 @@ def _build_payload(
     entries when ``--identify-speakers`` is on; otherwise empty. ``source``
     is ``"auto"`` for DB matches and ``"manual"`` for entries coming from
     the user's ``--speaker-map``.
-
-    ``batch_size`` is the ASR batch that produced the segments; ``None`` when
-    unknown (a resume from a v2 snapshot).
 
     Schema version 2 added both ``speaker_clusters`` and ``speaker_identities``;
     version 3 added ``parameters.batch_size``.
@@ -168,21 +209,7 @@ def _build_payload(
         "source_file": str(source_file),
         "transcribed_at": transcribed_at.isoformat(timespec="seconds"),
         "parameters": {
-            "backend": "whisperx",
-            "asr": f"whisperx-{config.model}",
-            "model": config.model,
-            "device": device,
-            "compute_type": compute_type,
-            "beam_size": config.beam_size,
-            "batch_size": batch_size,
-            "vad_filter": True,
-            "language_forced": config.language,
-            "initial_prompt": config.initial_prompt or None,
-            "hotwords": config.hotwords or None,
-            "anti_loop": config.anti_loop,
-            "condition_on_previous_text": False if config.anti_loop else None,
-            "compression_ratio_threshold": 2.0 if config.anti_loop else None,
-            "no_speech_threshold": 0.5 if config.anti_loop else None,
+            **{k: v for k, v in asr_parameters.items() if k not in ("diarization", "suspect_thresholds")},
             "diarization": {
                 "enabled": config.diarization.enabled,
                 "model_name": config.diarization.model_name,
@@ -190,10 +217,7 @@ def _build_payload(
                 "min_speakers": config.diarization.min_speakers,
                 "max_speakers": config.diarization.max_speakers,
             },
-            "suspect_thresholds": {
-                "avg_logprob": stats_mod.DEFAULT_AVG_LOGPROB_THRESHOLD,
-                "no_speech_prob": stats_mod.DEFAULT_NO_SPEECH_PROB_THRESHOLD,
-            },
+            "suspect_thresholds": asr_parameters.get("suspect_thresholds"),
         },
         "audio_info": {
             "language_detected": detected_language,
@@ -358,13 +382,13 @@ def _run_asr_and_align(
         source_file=input_path,
         transcribed_at=align_time,
         config=config,
-        device=device,
-        compute_type=compute_type,
+        asr_parameters=_asr_parameters(
+            config, device=device, compute_type=compute_type, batch_size=batch_size
+        ),
         detected_language=detected_language,
         language_probability=asr_result.get("language_probability"),
         segments=aligned_segments,
         processing_seconds=align_seconds,
-        batch_size=batch_size,
     )
 
     # Free safety net: write the aligned payload before diarization touches anything.
@@ -434,7 +458,6 @@ def _diarize_payload(
     decodes the input file here.
     """
     input_path = config.input_file.resolve()
-    asr_device = payload["parameters"].get("device") or "cpu"
 
     logger.info("Running speaker diarization (pyannote)...")
     if audio is None:
@@ -490,15 +513,13 @@ def _diarize_payload(
         source_file=input_path,
         transcribed_at=datetime.now(),
         config=config,
-        device=asr_device,
-        compute_type=payload["parameters"].get("compute_type") or "",
+        asr_parameters=_snapshot_asr_parameters(payload),
         detected_language=payload["audio_info"].get("language_detected") or "und",
         language_probability=payload["audio_info"].get("language_probability"),
         segments=diarized_segments,
         processing_seconds=float(payload.get("stats", {}).get("processing_seconds") or 0.0),
         speaker_clusters=speaker_clusters,
         speaker_identities=speaker_identities,
-        batch_size=payload["parameters"].get("batch_size"),
     )
 
 

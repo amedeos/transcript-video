@@ -91,7 +91,7 @@ Top-level keys at the current schema version (`3`, `pipeline.SCHEMA_VERSION`):
 - `schema_version`, `stage`, `source_file`, `transcribed_at`, `parameters`, `audio_info`, `stats`, `segments`, `full_text`
 - `speaker_clusters` (since v2): per-cluster cached embeddings — empty when diarization is off or extraction failed.
 - `speaker_identities` (since v2): per-cluster `{name, score, source}` — populated only when `--identify-speakers` is on, at pipeline time or re-render time.
-- `parameters.batch_size` (since v3): the ASR batch that produced the segments. On a resume it is carried from the snapshot, and it is `null` when the snapshot is v2.
+- `parameters.batch_size` (since v3): the ASR batch that produced the segments. On a resume it is carried from the snapshot like every other ASR parameter (see invariant #5), and it is `null` when the snapshot is v2.
 
 All field names are English (the explicit rename vs. the reference project, which used Italian field names like `file_sorgente`, `parametri`, `segmenti`).
 
@@ -116,6 +116,8 @@ The pipeline writes two persistence layers:
 Both share the same schema. The top-level `stage` field discriminates them (`"aligned"` vs `"complete"`). When refactoring `_build_payload()`, keep both stages going through the same builder so they stay structurally identical.
 
 `--resume-from-aligned PATH` skips ASR + alignment and feeds the snapshot straight to diarization. The aligned snapshot is the legitimate input form for resuming. `pipeline._load_aligned_payload` refuses a `*_transcript.json` that already carries speakers (segments, `speaker_clusters` or `speaker_identities`), because re-diarizing would clobber them. The one exception is a finished transcript with no speakers: a `--no-diarize` run writes no aligned snapshot, so its JSON is the only way to add diarization later.
+
+On a resume, **everything under `parameters` except `diarization` is carried from the snapshot** (`pipeline._snapshot_asr_parameters`). Those fields describe the ASR that produced the segments, which did not run again: the current run's `--model`, `--language`, prompt or beam flags must not relabel them. Only `diarization` describes the current run. `_build_payload` takes the ASR block ready-made (`_asr_parameters` on a fresh run), so both stages still go through one builder.
 
 ### 6. Pre-flight runs by default
 
