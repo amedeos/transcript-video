@@ -71,6 +71,10 @@ SENTENCE_END = (".", "?", "!", "…")
 _CLOSING = "\"'»”’)]}"
 """Closing quotes and brackets that may follow a sentence's final punctuation."""
 
+DOWNLOAD_SIZE = {"float32": "2.5 GB", "int8": "670 MB"}
+"""Approximate download of the weight files (encoder + decoder); the rest is a few MB."""
+ONNX_ASR_SERIES = "0.12."
+"""The onnx-asr releases this module was written against (pyproject pins >=0.12,<0.13)."""
 _COMMON_FILES = ("config.json", "vocab.txt")
 _MODEL_FILES = {
     "float32": ("encoder-model.onnx", "encoder-model.onnx.data", "decoder_joint-model.onnx"),
@@ -84,8 +88,28 @@ def is_parakeet(model: str | None) -> bool:
 
 
 def weights_for(compute_type: str | None) -> str:
-    """ONNX weights for a resolved compute type: ``int8`` for any int8 type, else ``float32``."""
+    """ONNX weights for a compute type: ``int8`` for any int8 type, else ``float32``."""
     return "int8" if (compute_type or "").lower().startswith("int8") else "float32"
+
+
+def resolve_weights(compute_type: str | None) -> tuple[str, str | None]:
+    """Parakeet's weights for ``--compute-type``, and a warning when it isn't exact.
+
+    Parakeet ships float32 and int8 weights only. Unset, ``auto``,
+    ``default`` and ``float32`` give float32 (lossless, the CPU default).
+    Every int8 type gives int8. ``int16``, a quantization asked for to save
+    RAM, gets the closest quantized weights (int8) rather than full size;
+    ``float16`` / ``bfloat16`` get float32, as ctranslate2 does on CPU.
+    """
+    requested = (compute_type or "auto").lower()
+    if requested in ("auto", "default", "float32"):
+        return "float32", None
+    if requested.startswith("int8"):
+        return "int8", None
+    weights = "int8" if requested == "int16" else "float32"
+    return weights, (
+        f"Parakeet has float32 and int8 weights only: --compute-type {compute_type} runs {weights}."
+    )
 
 
 def model_files(compute_type: str | None) -> tuple[str, ...]:
@@ -117,8 +141,11 @@ def _wanted(compute_type: str | None) -> list[tuple[str, str, tuple[str, ...], P
     ]
 
 
-def missing_files(compute_type: str | None) -> list[str]:
-    """Files neither in our folders nor in the HuggingFace cache: a first run downloads them."""
+def missing_files(compute_type: str | None) -> list[tuple[str, str, str]]:
+    """``(repo, revision, name)`` of the files neither in our folders nor in the HF cache.
+
+    A first run downloads them.
+    """
     from huggingface_hub import try_to_load_from_cache
 
     missing = []
@@ -128,8 +155,16 @@ def missing_files(compute_type: str | None) -> list[str]:
                 continue
             cached = try_to_load_from_cache(repo, name, revision=revision)
             if not (isinstance(cached, str) and Path(cached).is_file()):
-                missing.append(f"{repo}/{name}")
+                missing.append((repo, revision, name))
     return missing
+
+
+def download_estimate(compute_type: str | None, missing: list[tuple[str, str, str]]) -> str:
+    """Rough size of downloading ``missing``: the weight size when a weight file is in it."""
+    heavy = set(_MODEL_FILES[weights_for(compute_type)])
+    if any(repo == HF_REPO and name in heavy for repo, _, name in missing):
+        return DOWNLOAD_SIZE[weights_for(compute_type)]
+    return "a few MB"
 
 
 def prepare_files(compute_type: str | None) -> tuple[Path, Path]:

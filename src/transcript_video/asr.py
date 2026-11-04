@@ -16,9 +16,11 @@ import logging
 import math
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+
+from . import parakeet as parakeet_mod
 
 logger = logging.getLogger("transcript_video.asr")
 
@@ -59,6 +61,68 @@ MIN_GPU_COMPUTE_TYPE = "float16"
 # float32 at roughly 10 GB peak, against about 18 GB at 16, at a modest speed cost.
 GPU_DEFAULT_BATCH_SIZE = 16
 CPU_DEFAULT_BATCH_SIZE = 4
+
+# ASR engines. ``--model auto`` (the default) picks whisperX large-v3 when
+# the ASR can run on a float16 GPU and Parakeet otherwise (user decision,
+# 2026-11-04: on CPU, Parakeet is ~4x faster than large-v3). Parakeet
+# (``--model parakeet``) always runs on CPU through ONNX Runtime.
+ENGINE_WHISPERX = "whisperx"
+ENGINE_PARAKEET = "parakeet"
+AUTO_MODEL = "auto"
+DEFAULT_WHISPER_MODEL = "large-v3"
+DEFAULT_BEAM_SIZE = 5
+
+
+def requested_engine(model: str | None) -> str:
+    """``auto``, ``parakeet`` or ``whisperx`` for a ``--model`` value (unset = ``auto``)."""
+    name = (model or AUTO_MODEL).strip().lower()
+    if name == AUTO_MODEL:
+        return AUTO_MODEL
+    return ENGINE_PARAKEET if parakeet_mod.is_parakeet(name) else ENGINE_WHISPERX
+
+
+def resolve_model_name(model: str | None, engine: str) -> str:
+    """The model that runs: ``auto`` becomes large-v3 or Parakeet, aliases their canonical name."""
+    if engine == ENGINE_PARAKEET:
+        return parakeet_mod.MODEL_NAME
+    name = (model or AUTO_MODEL).strip()
+    return DEFAULT_WHISPER_MODEL if name.lower() == AUTO_MODEL else name
+
+
+def resolve_beam_size(beam_size: int | None) -> int:
+    """whisperX beam width: the explicit value, else :data:`DEFAULT_BEAM_SIZE`."""
+    return DEFAULT_BEAM_SIZE if beam_size is None else beam_size
+
+
+def parakeet_conflicts(config: Any, *, auto_reason: str | None = None) -> str | None:
+    """The error for the options of ``config`` (a RunConfig) Parakeet can't apply, or ``None``.
+
+    User decision (2026-11-04): with Parakeet these options stop the run
+    instead of being ignored. Parakeet detects the language by itself and
+    takes no prompt, hotwords, beam width or anti-loop settings. An
+    explicitly disabled prompt or hotwords (``""``) is fine. Shared by the
+    pre-flight check and the pipeline. ``auto_reason``: why ``--model auto``
+    chose it (``DevicePlan.auto_reason``); ``None`` for an explicit model.
+    """
+    found = []
+    if config.language:
+        found.append(f"--language {config.language}")
+    if config.initial_prompt:
+        found.append("--prompt / --prompt-file")
+    if config.hotwords:
+        found.append("--hotwords / --hotwords-file")
+    if config.beam_size is not None:
+        found.append(f"--beam_size {config.beam_size}")
+    if config.anti_loop:
+        found.append("--anti-loop")
+    if not found:
+        return None
+    why = f"--model auto chose Parakeet ({auto_reason}). " if auto_reason else ""
+    return (
+        f"{why}Parakeet can't apply {', '.join(found)} (set on the command line or in the "
+        "config file): it detects the language by itself and takes no prompt, hotwords, "
+        "beam width or anti-loop settings. Remove them, or pass --model large-v3 to use whisperX."
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -151,8 +215,13 @@ class DevicePlan:
       use CUDA and torch can't: then it runs on ``cpu``.
     - ``error``: set when an explicit ``cuda`` request can't be honored.
     - ``notes``: warnings worth logging (mixed devices, fallbacks).
-    - ``compute_type``: the ctranslate2 compute type, filled in by the
-      pipeline once ``asr`` is known (see :func:`resolve_compute_type`).
+    - ``compute_type``: the ASR compute type, filled in by the pipeline once
+      ``asr`` is known (see :func:`resolve_compute_type`).
+    - ``engine``: the ASR engine that runs (``whisperx`` or ``parakeet``);
+      ``None`` when no ASR runs. With ``parakeet``, ``asr`` is ``cpu`` (ONNX
+      Runtime) and ``vad`` is ``None`` (its VAD is ONNX, not torch).
+    - ``auto_reason``: why ``--model auto`` chose ``engine``, for logs and
+      messages; ``None`` when the model was explicit.
     """
 
     asr: str | None
@@ -161,6 +230,8 @@ class DevicePlan:
     error: str | None = None
     notes: tuple[str, ...] = ()
     compute_type: str | None = None
+    engine: str | None = None
+    auto_reason: str | None = None
 
     @property
     def torch_on_cpu(self) -> bool:
@@ -173,8 +244,10 @@ class DevicePlan:
         return any((self.asr, self.torch))
 
 
-def plan_devices(requested: str | None, *, run_asr: bool, run_torch: bool) -> DevicePlan:
-    """Decide the devices for the stages that will run. Never exits.
+def plan_devices(
+    requested: str | None, *, run_asr: bool, run_torch: bool, engine: str = ENGINE_WHISPERX
+) -> DevicePlan:
+    """Decide the ASR engine and the devices for the stages that will run. Never exits.
 
     The single source of the device rules, shared by the pre-flight check and
     the pipeline so they can't disagree:
@@ -184,11 +257,87 @@ def plan_devices(requested: str | None, *, run_asr: bool, run_torch: bool) -> De
     - ``cuda``: every library that will run must be able to use CUDA, otherwise
       ``error`` is set. An explicit GPU request never silently becomes CPU work.
 
-    ``run_asr`` implies torch work too (whisperX's VAD and the alignment).
+    ``run_torch`` is torch work besides the ASR's own (diarization and
+    embeddings). With whisperX, ``run_asr`` implies torch work too (its VAD
+    and the alignment); Parakeet needs none.
+
+    ``engine`` is :func:`requested_engine` of ``--model``. ``auto`` becomes
+    whisperX when ctranslate2 can use a float16 GPU, or when ``--device
+    cuda`` was requested (so a GPU request that can't be met is an error,
+    not a Parakeet run); otherwise Parakeet.
     """
     req = (requested or "auto").lower()
     if req not in _VALID_DEVICES:
         return DevicePlan(None, None, error=f"unknown device {requested!r}; use auto, cuda or cpu.")
+    if run_asr and engine == AUTO_MODEL:
+        return _plan_auto(req, run_torch=run_torch)
+    if run_asr and engine == ENGINE_PARAKEET:
+        return replace(_plan_parakeet(req, run_torch=run_torch), engine=ENGINE_PARAKEET)
+    plan = _plan_whisperx(req, run_asr=run_asr, run_torch=run_torch)
+    return replace(plan, engine=ENGINE_WHISPERX if run_asr and not plan.error else None)
+
+
+def _plan_auto(req: str, *, run_torch: bool) -> DevicePlan:
+    """``--model auto``: whisperX if its plan puts the ASR on CUDA (or on request), else Parakeet.
+
+    The choice follows the whole whisperX plan, not just the ctranslate2
+    probe: when torch can't use CUDA and whisperX can't run its VAD apart,
+    the whisperX ASR would end up on CPU, and on CPU the answer is Parakeet.
+    An explicit ``--device cuda`` keeps whisperX, so a GPU request that
+    can't be met stays an error.
+    """
+    if req == "cpu":
+        plan = _plan_parakeet(req, run_torch=run_torch)
+        return replace(plan, engine=ENGINE_PARAKEET, auto_reason="--device cpu")
+    whisper = _plan_whisperx(req, run_asr=True, run_torch=run_torch)
+    if req == "cuda" or whisper.asr == "cuda":
+        reason = "--device cuda" if req == "cuda" else "float16 GPU"
+        return replace(
+            whisper, engine=None if whisper.error else ENGINE_WHISPERX, auto_reason=reason
+        )
+    ct2_cuda, ct2_hint = check_cuda_available()
+    notes: tuple[str, ...] = ()
+    if not ct2_cuda:
+        reason = "no CUDA GPU for the whisperX ASR"
+    elif ct2_hint != MIN_GPU_COMPUTE_TYPE:
+        reason = "GPU below the float16 minimum"
+        notes = (
+            "GPU below the float16 minimum (compute capability < 7.0, e.g. GTX 10xx): "
+            "--model auto runs Parakeet on cpu. Pass --model large-v3 --device cuda to "
+            "run whisperX on this GPU in float32 instead.",
+        )
+    else:
+        reason = "torch can't use CUDA and this whisperX can't run its VAD apart from the ASR"
+        notes = (
+            f"--model auto runs Parakeet on cpu: {reason}. Pass --model large-v3 to run "
+            "whisperX on cpu instead.",
+        )
+    plan = _plan_parakeet(req, run_torch=run_torch)
+    return replace(plan, engine=ENGINE_PARAKEET, auto_reason=reason, notes=notes + plan.notes)
+
+
+def _plan_parakeet(req: str, *, run_torch: bool) -> DevicePlan:
+    """Parakeet on CPU; torch (diarization) follows ``req`` like with whisperX."""
+    if req == "cpu":
+        return DevicePlan(asr="cpu", torch="cpu" if run_torch else None)
+    torch_ok = run_torch and torch_cuda_available()
+    if req == "cuda":
+        if run_torch and not torch_ok:
+            return DevicePlan(None, None, error=(
+                "device 'cuda' was requested (--device or config) but diarization (torch) "
+                "cannot use a CUDA device. Fix the GPU setup, or pass --device auto "
+                "(use CPU when there is no GPU) or --device cpu."
+            ))
+        what = "--device cuda applies to diarization" if run_torch else "nothing in this run uses the GPU"
+        return DevicePlan(
+            asr="cpu", torch="cuda" if run_torch else None,
+            notes=(f"Parakeet runs on cpu (ONNX Runtime): {what}.",),
+        )
+    return DevicePlan(asr="cpu", torch=("cuda" if torch_ok else "cpu") if run_torch else None)
+
+
+def _plan_whisperx(req: str, *, run_asr: bool, run_torch: bool) -> DevicePlan:
+    """The device rules for whisperX (ctranslate2 ASR + torch VAD/alignment)."""
     run_torch = run_torch or run_asr
     if req == "cpu":
         cpu_if = lambda runs: "cpu" if runs else None  # noqa: E731

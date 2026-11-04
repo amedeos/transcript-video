@@ -25,20 +25,24 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="transcript-from-video",
         description=(
-            "Transcribe and diarize a video/audio file using whisperX "
-            "(faster-whisper backend + pyannote speaker diarization). "
+            "Transcribe and diarize a video/audio file: whisperX large-v3 on a GPU, "
+            "NVIDIA Parakeet on CPU (--model), pyannote speaker diarization. "
             "JSON is always written; SRT, TXT, and Markdown are opt-in."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s video.mp4
-  %(prog)s video.mp4 --beam_size 10 --srt
-  %(prog)s video.mp4 --language en --txt --md
-  %(prog)s video.mp4 --prompt "Glossary: API, GPU, microservices."
-  %(prog)s video.mp4 --hotwords "Anthropic Claude faster-whisper"
-  %(prog)s video.mp4 --anti-loop
+  %(prog)s video.mp4                     # large-v3 on a GPU, Parakeet on CPU
+  %(prog)s video.mp4 --model parakeet --basename pk
+  %(prog)s video.mp4 --model large-v3 --beam_size 10 --srt
+  %(prog)s video.mp4 --model large-v3 --language en --txt --md
+  %(prog)s video.mp4 --model large-v3 --prompt "Glossary: API, GPU, microservices."
+  %(prog)s video.mp4 --model large-v3 --hotwords "Anthropic Claude faster-whisper"
   %(prog)s meeting.mp4 --md --speaker-map "SPEAKER_00=Amedeo,SPEAKER_01=Tizio" --tag openshift
+
+--language, --prompt, --hotwords, --beam_size and --anti-loop are whisperX
+options: with Parakeet (also chosen by the default --model auto on CPU) they
+stop the run. Add --model large-v3 to use them on CPU.
         """,
     )
 
@@ -54,12 +58,22 @@ Examples:
     )
 
     model_group = parser.add_argument_group("Model / device")
-    model_group.add_argument("--model", default="large-v3", help="whisperX model name (default: large-v3).")
+    model_group.add_argument(
+        "--model",
+        default="auto",
+        help=(
+            "ASR model (default: auto). 'auto' = whisperX large-v3 when the ASR can run on a "
+            "float16 GPU, otherwise Parakeet on CPU. 'parakeet' = NVIDIA Parakeet TDT 0.6B v3 "
+            "(CPU, ONNX Runtime; 25 European languages, detected automatically; no --language, "
+            "--prompt, --hotwords, --beam_size or --anti-loop). Any other value is a whisperX "
+            "model name (e.g. large-v3, small)."
+        ),
+    )
     model_group.add_argument(
         "--beam_size",
         type=int,
-        default=5,
-        help="Beam search width (default: 5).",
+        default=None,
+        help="Beam search width, whisperX only (default: 5).",
     )
     model_group.add_argument(
         "--device",

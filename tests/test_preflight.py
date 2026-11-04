@@ -16,6 +16,7 @@ from transcript_video.preflight import (
     check_ffmpeg,
     check_hf_token,
     check_identify_db,
+    check_parakeet,
     check_whisperx_api,
     report_results,
     run_preflight,
@@ -497,3 +498,183 @@ class TestReportResults:
     def test_any_failure_returns_false(self):
         rs = [CheckResult("a", True, "x"), CheckResult("b", False, "y")]
         assert report_results(rs) is False
+
+
+class TestAsrEngineChecks:
+    @staticmethod
+    def _no_gpu(monkeypatch):
+        monkeypatch.setattr("transcript_video.preflight.asr_mod.check_cuda_available", lambda: (False, None))
+        monkeypatch.setattr("transcript_video.preflight.asr_mod.torch_cuda_available", lambda: False)
+
+    @staticmethod
+    def _stub_other_checks(monkeypatch, *, parakeet_ok=True):
+        for name in ("check_ffmpeg", "check_whisperx_api"):
+            monkeypatch.setattr(f"transcript_video.preflight.{name}", lambda n=name: CheckResult(n, True, "stub"))
+        monkeypatch.setattr(
+            "transcript_video.preflight.check_parakeet",
+            lambda compute_type, network: CheckResult("parakeet", parakeet_ok, compute_type or "default"),
+        )
+
+    def test_auto_on_cpu_reports_parakeet_and_checks_it(self, cfg, monkeypatch):
+        self._no_gpu(monkeypatch)
+        self._stub_other_checks(monkeypatch)
+        cfg.diarization = DiarizationConfig(enabled=False)
+        results = {r.name: r for r in run_preflight(cfg, network=False)}
+        assert results["asr_engine"].ok
+        assert "Parakeet" in results["asr_engine"].message
+        assert "--model auto" in results["asr_engine"].message
+        assert "parakeet" in results
+
+    def test_conflicting_option_fails(self, cfg, monkeypatch):
+        self._no_gpu(monkeypatch)
+        self._stub_other_checks(monkeypatch)
+        cfg.diarization = DiarizationConfig(enabled=False)
+        cfg.language = "it"
+        results = {r.name: r for r in run_preflight(cfg, network=False)}
+        assert not results["asr_engine"].ok
+        assert "--language it" in results["asr_engine"].message
+
+    def test_device_cpu_still_resolves_the_engine(self, cfg, monkeypatch):
+        self._stub_other_checks(monkeypatch)
+        cfg.device = "cpu"
+        cfg.diarization = DiarizationConfig(enabled=False)
+        results = {r.name: r for r in run_preflight(cfg, network=False)}
+        assert results["cuda"].message.startswith("skipped")
+        assert "Parakeet" in results["asr_engine"].message
+        assert "parakeet" in results
+
+    def test_whisperx_run_has_no_parakeet_check(self, cfg, monkeypatch):
+        monkeypatch.setattr("transcript_video.preflight.asr_mod.check_cuda_available", lambda: (True, "float16"))
+        monkeypatch.setattr("transcript_video.preflight.asr_mod.torch_cuda_available", lambda: True)
+        self._stub_other_checks(monkeypatch)
+        cfg.diarization = DiarizationConfig(enabled=False)
+        results = {r.name: r for r in run_preflight(cfg, network=False)}
+        assert results["asr_engine"].message == "whisperX large-v3 on cuda (--model auto: float16 GPU)"
+        assert "parakeet" not in results
+
+    def test_device_cpu_reason_is_the_request_not_a_missing_gpu(self, cfg, monkeypatch):
+        monkeypatch.setattr("transcript_video.preflight.asr_mod.check_cuda_available", lambda: (True, "float16"))
+        self._stub_other_checks(monkeypatch)
+        cfg.device = "cpu"
+        cfg.diarization = DiarizationConfig(enabled=False)
+        results = {r.name: r for r in run_preflight(cfg, network=False)}
+        assert results["asr_engine"].message.endswith("(--model auto: --device cpu)")
+
+    @pytest.mark.parametrize(
+        "diarize, torch, expected",
+        [
+            (True, True, "available: diarization on cuda"),
+            (True, False, "not available for diarization"),
+            (False, True, "not needed: Parakeet runs on cpu"),
+        ],
+    )
+    def test_cuda_message_for_parakeet_doesnt_blame_the_gpu(self, cfg, monkeypatch, diarize, torch, expected):
+        monkeypatch.setattr("transcript_video.preflight.asr_mod.check_cuda_available", lambda: (True, "float16"))
+        monkeypatch.setattr("transcript_video.preflight.asr_mod.torch_cuda_available", lambda: torch)
+        self._stub_other_checks(monkeypatch)
+        monkeypatch.setattr(
+            "transcript_video.preflight.check_hf_token", lambda token, network: CheckResult("hf_token", True, "")
+        )
+        cfg.model = "parakeet"
+        cfg.diarization = DiarizationConfig(enabled=diarize, hf_token="t")
+        results = {r.name: r for r in run_preflight(cfg, network=False)}
+        assert results["cuda"].ok
+        assert results["cuda"].message.startswith(expected)
+        assert "fall back" not in results["cuda"].message
+
+    def test_resume_has_no_engine_checks(self, cfg, monkeypatch, tmp_path):
+        self._no_gpu(monkeypatch)
+        self._stub_other_checks(monkeypatch)
+        cfg.resume_from_aligned = tmp_path / "x.aligned.json"
+        cfg.diarization = DiarizationConfig(enabled=False)
+        names = [r.name for r in run_preflight(cfg, network=False)]
+        assert "asr_engine" not in names and "parakeet" not in names
+
+
+class TestCheckParakeet:
+    @pytest.fixture
+    def fakes(self, monkeypatch):
+        onnx_asr = types.ModuleType("onnx_asr")
+        ort = types.ModuleType("onnxruntime")
+        ort.get_available_providers = lambda: ["CPUExecutionProvider"]
+        monkeypatch.setitem(sys.modules, "onnx_asr", onnx_asr)
+        monkeypatch.setitem(sys.modules, "onnxruntime", ort)
+        monkeypatch.setattr("transcript_video.preflight.importlib.metadata.version", lambda name: "0.12.0")
+        state = types.SimpleNamespace(missing=[], exists=True, ort=ort)
+        monkeypatch.setattr("transcript_video.preflight.parakeet_mod.missing_files", lambda w: state.missing)
+        hub = types.ModuleType("huggingface_hub")
+
+        def file_exists(repo, filename, revision):
+            if isinstance(state.exists, Exception):
+                raise state.exists
+            return state.exists
+
+        hub.file_exists = file_exists
+        monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+        return state
+
+    def test_ready(self, fakes):
+        r = check_parakeet(None, network=True)
+        assert r.ok and "float32 weights ready" in r.message
+
+    REPO = "istupakov/parakeet-tdt-0.6b-v3-onnx"
+
+    def test_missing_files_are_a_download_not_a_failure(self, fakes):
+        fakes.missing = [(self.REPO, "rev", "encoder-model.onnx.data")]
+        r = check_parakeet(None, network=True)
+        assert r.ok and "downloads 1 file(s) (~2.5 GB)" in r.message
+
+    def test_int8_download_size(self, fakes):
+        fakes.missing = [(self.REPO, "rev", "encoder-model.int8.onnx")]
+        assert "~670 MB" in check_parakeet("int8", network=False).message
+
+    def test_small_files_only(self, fakes):
+        fakes.missing = [(self.REPO, "rev", "vocab.txt"), ("istupakov/silero-vad-onnx", "rev", "silero_vad.onnx")]
+        assert "downloads 2 file(s) (~a few MB)" in check_parakeet(None, network=False).message
+
+    def test_unreachable_source_fails(self, fakes):
+        fakes.missing = [(self.REPO, "rev", "vocab.txt")]
+        fakes.exists = OSError("offline")
+        r = check_parakeet(None, network=True)
+        assert not r.ok and "not reachable" in r.message
+
+    def test_every_missing_file_is_looked_up(self, fakes, monkeypatch):
+        fakes.missing = [(self.REPO, "rev", "vocab.txt"), ("istupakov/silero-vad-onnx", "rev2", "config.json")]
+        seen = []
+        hub = sys.modules["huggingface_hub"]
+        hub.file_exists = lambda repo, filename, revision: seen.append((repo, revision)) or repo == self.REPO
+        r = check_parakeet(None, network=True)
+        assert seen == [(self.REPO, "rev"), ("istupakov/silero-vad-onnx", "rev2")]
+        assert not r.ok and "istupakov/silero-vad-onnx/config.json" in r.message
+
+    def test_unknown_version_is_not_a_failure(self, fakes, monkeypatch):
+        import importlib.metadata as md
+
+        def missing(name):
+            raise md.PackageNotFoundError(name)
+
+        monkeypatch.setattr("transcript_video.preflight.importlib.metadata.version", missing)
+        r = check_parakeet(None, network=False)
+        assert r.ok and "version unknown" in r.message
+
+    def test_broken_native_import_is_a_fail_line(self, fakes):
+        def boom():
+            raise OSError("libonnxruntime.so: cannot open shared object file")
+
+        fakes.ort.get_available_providers = boom
+        r = check_parakeet(None, network=False)
+        assert not r.ok and "OSError" in r.message
+
+    def test_wrong_onnx_asr_version_fails(self, fakes, monkeypatch):
+        monkeypatch.setattr("transcript_video.preflight.importlib.metadata.version", lambda name: "0.13.1")
+        r = check_parakeet(None, network=False)
+        assert not r.ok and "0.12.x" in r.message
+
+    def test_no_cpu_provider_fails(self, fakes):
+        fakes.ort.get_available_providers = lambda: ["CUDAExecutionProvider"]
+        assert not check_parakeet(None, network=False).ok
+
+    def test_onnx_asr_missing_fails(self, fakes, monkeypatch):
+        monkeypatch.setitem(sys.modules, "onnx_asr", None)
+        r = check_parakeet(None, network=False)
+        assert not r.ok and "not usable" in r.message

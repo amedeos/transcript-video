@@ -49,8 +49,8 @@ class IdentifyConfig:
 @dataclass
 class RunConfig:
     input_file: Path
-    model: str = "large-v3"
-    beam_size: int = 5
+    model: str = "auto"  # ``auto``: large-v3 on a float16 GPU, else Parakeet (CPU).
+    beam_size: int | None = None  # whisperX only; ``None`` = 5. Parakeet: must stay unset.
     device: str | None = None  # ``cuda`` / ``cpu`` / ``None`` = auto.
     compute_type: str | None = None  # Override (e.g. ``int8_float16``); ``None`` = auto.
     threads: int | None = None  # CPU threads; ``None`` = logical CPUs - 1.
@@ -77,7 +77,3 @@ class RunConfig:
         """ASR + alignment run (not a resume)."""
         return self.resume_from_aligned is None
 
-    @property
-    def runs_torch(self) -> bool:
-        """A torch stage runs: VAD + alignment with the ASR, or diarization."""
-        return self.runs_asr or self.diarization.enabled

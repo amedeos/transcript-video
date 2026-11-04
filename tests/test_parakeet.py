@@ -46,6 +46,25 @@ class TestNames:
         assert parakeet.vad_dir() == root / f"silero-vad-{parakeet.VAD_REVISION[:12]}"
 
 
+class TestResolveWeights:
+    @pytest.mark.parametrize("value", [None, "auto", "default", "float32", "FLOAT32"])
+    def test_float32(self, value):
+        assert parakeet.resolve_weights(value) == ("float32", None)
+
+    @pytest.mark.parametrize("value", ["int8", "int8_float32", "int8_float16", "int8_bfloat16"])
+    def test_int8(self, value):
+        assert parakeet.resolve_weights(value) == ("int8", None)
+
+    def test_int16_keeps_a_quantization(self):
+        weights, warning = parakeet.resolve_weights("int16")
+        assert weights == "int8" and "runs int8" in warning
+
+    @pytest.mark.parametrize("value", ["float16", "bfloat16"])
+    def test_half_precision_runs_float32_with_a_warning(self, value):
+        weights, warning = parakeet.resolve_weights(value)
+        assert weights == "float32" and f"--compute-type {value} runs float32" in warning
+
+
 class TestWords:
     def test_tokens_grouped_into_words_with_file_times(self):
         words = parakeet.words_from_tokens(
@@ -202,18 +221,26 @@ class TestModelFiles:
         assert fake_hub.downloads == []
 
     def test_missing_files_cover_the_model_and_the_vad(self, fake_hub):
-        assert parakeet.missing_files("int8") == _all_files("int8")
+        expected = [
+            (parakeet.HF_REPO, parakeet.HF_REVISION, n) for n in parakeet.model_files("int8")
+        ] + [(parakeet.VAD_REPO, parakeet.VAD_REVISION, n) for n in parakeet.VAD_FILES]
+        assert parakeet.missing_files("int8") == expected
         blob = fake_hub.blob(parakeet.HF_REPO, "config.json")  # in the HF cache
         blob.parent.mkdir(parents=True, exist_ok=True)
         blob.write_text("{}")
         parakeet.vad_dir().mkdir(parents=True)
         (parakeet.vad_dir() / "silero_vad.onnx").write_text("")  # in our folder
-        assert parakeet.missing_files("int8") == [
-            f"{parakeet.HF_REPO}/vocab.txt",
-            f"{parakeet.HF_REPO}/encoder-model.int8.onnx",
-            f"{parakeet.HF_REPO}/decoder_joint-model.int8.onnx",
-            f"{parakeet.VAD_REPO}/config.json",
+        assert [name for _, _, name in parakeet.missing_files("int8")] == [
+            "vocab.txt", "encoder-model.int8.onnx", "decoder_joint-model.int8.onnx", "config.json",
         ]
+
+    def test_download_estimate(self):
+        weights = [(parakeet.HF_REPO, parakeet.HF_REVISION, "encoder-model.onnx.data")]
+        small = [(parakeet.HF_REPO, parakeet.HF_REVISION, "vocab.txt"),
+                 (parakeet.VAD_REPO, parakeet.VAD_REVISION, "silero_vad.onnx")]
+        assert parakeet.download_estimate("float32", weights) == "2.5 GB"
+        assert parakeet.download_estimate("int8", [(parakeet.HF_REPO, "r", "encoder-model.int8.onnx")]) == "670 MB"
+        assert parakeet.download_estimate("float32", small) == "a few MB"
 
 
 # --- transcribe ----------------------------------------------------------------------------
