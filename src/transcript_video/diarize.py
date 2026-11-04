@@ -9,11 +9,16 @@ Resolves the HuggingFace token from (in order):
 
 from __future__ import annotations
 
+import contextlib
 import inspect
+import logging
 import os
 import sys
+import warnings
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("transcript_video.diarize")
 
 
 def resolve_hf_token(cli_token: str | None) -> str | None:
@@ -197,6 +202,11 @@ def diarize_and_assign(
             sys.exit(1)
         raise
 
+    try:
+        _share_embedding_backbone(diarize_pipeline)
+    except Exception as e:  # a speed-up must never stop diarization
+        logger.warning("Diarization: stock pyannote embeddings (%s: %s).", type(e).__name__, e)
+
     diarize_kwargs: dict[str, Any] = {}
     if num_speakers is not None:
         diarize_kwargs["num_speakers"] = num_speakers
@@ -207,6 +217,132 @@ def diarize_and_assign(
 
     diarize_segments = diarize_pipeline(audio, **diarize_kwargs)
     return assign_fn(diarize_segments, aligned)
+
+
+def _share_embedding_backbone(diarize_pipeline: Any) -> bool:
+    """Make pyannote run the speaker-embedding network once per window.
+
+    pyannote's ``SpeakerDiarization.get_embeddings`` feeds the embedding
+    model one row per (window, local speaker): the same 10 s of audio, three
+    times, each with that speaker's mask. Only the final statistics pooling
+    reads the mask, so the network (fbank + ResNet) computes the same frame
+    features three times. On CPU that is nearly all of the diarization time
+    (230 of 237 s on a 2-minute clip, measured on a laptop).
+
+    The WeSpeaker ResNet models already split the forward pass in two
+    (``forward_frames`` and ``forward_embedding``), and the pipeline never
+    calls the halves. This swaps the class of the pipeline's embedding
+    wrapper for a subclass whose ``__call__`` runs ``forward_frames`` once
+    per distinct window in the batch (the rows of one window are consecutive
+    and carry the same audio) and ``forward_embedding`` once per row with
+    its mask: the operations of ``forward()``. The row batch is left as it
+    is, so each pooling and linear layer sees the same rows as in stock
+    pyannote, and the network sees fewer windows per call (less memory).
+
+    It relies on pyannote internals (``model._embedding`` and its
+    ``model_``), so nothing is trusted blindly:
+
+    - the pieces are feature-detected; a pipeline without them (no
+      embedding model, another pyannote version) stays stock;
+    - a self-check compares the shared and stock calls on a small random
+      batch, and any difference or error restores the stock class;
+    - an error inside a shared call during the run restores the stock
+      class and redoes that batch the stock way, so diarization never
+      fails because of this.
+
+    Returns whether sharing is on.
+    """
+    pyannote_pipeline = getattr(diarize_pipeline, "model", None)
+    embedding = getattr(pyannote_pipeline, "_embedding", None)
+    if embedding is None:
+        logger.info("Diarization: this pipeline has no pyannote embedding model; nothing to share.")
+        return False
+    network = getattr(embedding, "model_", None)
+    if not (
+        callable(getattr(network, "forward_frames", None))
+        and callable(getattr(network, "forward_embedding", None))
+    ):
+        logger.info(
+            "Diarization: stock pyannote embeddings (the embedding network has no "
+            "forward_frames/forward_embedding split)."
+        )
+        return False
+    base = type(embedding)
+    if getattr(base, "_shares_backbone", False):
+        return True
+
+    def __call__(self, waveforms, masks=None):
+        if masks is None:
+            return base.__call__(self, waveforms, masks=masks)
+        try:
+            return _shared_backbone_embeddings(self, waveforms, masks)
+        except Exception as e:  # never let the shortcut break diarization
+            logger.warning(
+                "Diarization: shared embedding network failed (%s: %s); "
+                "falling back to stock pyannote embeddings.", type(e).__name__, e,
+            )
+            self.__class__ = base
+            return base.__call__(self, waveforms, masks=masks)
+
+    try:
+        embedding.__class__ = type(
+            f"SharedBackbone{base.__name__}", (base,), {"__call__": __call__, "_shares_backbone": True}
+        )
+        _self_check(embedding, base)
+    except Exception as e:
+        with contextlib.suppress(Exception):
+            embedding.__class__ = base
+        logger.warning(
+            "Diarization: stock pyannote embeddings (the shared embedding network is not "
+            "usable here: %s: %s).", type(e).__name__, e,
+        )
+        return False
+    logger.info("Diarization: embedding network run once per window, shared by its local speakers.")
+    return True
+
+
+def _shared_backbone_embeddings(embedding: Any, waveforms, masks):
+    """Embeddings for (window, speaker) rows, one ``forward_frames`` per distinct window."""
+    import torch
+
+    # Rows of the same window are consecutive and carry the same audio.
+    keep, index = [0], [0]
+    for i in range(1, len(waveforms)):
+        if not torch.equal(waveforms[i], waveforms[keep[-1]]):
+            keep.append(i)
+        index.append(len(keep) - 1)
+    network = embedding.model_
+    with torch.inference_mode(), warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        frames = network.forward_frames(waveforms[keep].to(embedding.device))
+        if len(keep) < len(waveforms):
+            frames = frames[torch.tensor(index, device=frames.device)]
+        embeddings = network.forward_embedding(frames, weights=masks.to(embedding.device))
+    return embeddings.cpu().numpy()
+
+
+# Self-check batch: 2 windows x 3 local speakers of 2 s noise, the pipeline's row layout.
+_CHECK_WINDOWS, _CHECK_SPEAKERS, _CHECK_SECONDS, _CHECK_FRAMES = 2, 3, 2.0, 100
+
+
+def _self_check(embedding: Any, base: type) -> None:
+    """Raise unless the shared call reproduces the stock call on a small random batch."""
+    import numpy as np
+    import torch
+
+    generator = torch.Generator().manual_seed(0)
+    samples = int(_CHECK_SECONDS * getattr(embedding, "sample_rate", 16000))
+    windows = 0.1 * torch.randn(_CHECK_WINDOWS, 1, 1, samples, generator=generator)
+    waveforms = windows.repeat_interleave(_CHECK_SPEAKERS, dim=0).reshape(-1, 1, samples)
+    masks = (torch.rand(len(waveforms), _CHECK_FRAMES, generator=generator) > 0.5).float()
+    stock = base.__call__(embedding, waveforms, masks=masks)
+    shared = _shared_backbone_embeddings(embedding, waveforms, masks)
+    if stock.shape != shared.shape:
+        raise ValueError(f"shape {shared.shape} != stock {stock.shape}")
+    if not np.array_equal(np.isnan(stock), np.isnan(shared)):
+        raise ValueError("NaN pattern differs from stock")
+    if not np.allclose(stock, shared, rtol=1e-4, atol=1e-5, equal_nan=True):
+        raise ValueError("embeddings differ from stock")
 
 
 from .stats import count_unique_speakers  # noqa: E402,F401  (re-export for backward compat)
